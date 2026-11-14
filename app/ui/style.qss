@@ -1,0 +1,67 @@
+QWidget {
+    font-family: "Microsoft YaHei UI", "Segoe UI";
+    font-size: 13px;
+    color: #1f2329;
+}
+QMainWindow, QDialog {
+    background: #f5f7fa;
+}
+QListWidget#sidebar {
+    background: #ffffff;
+    border: none;
+    border-right: 1px solid #e5e7eb;
+    padding-top: 8px;
+    outline: none;
+}
+QListWidget#sidebar::item {
+    padding: 10px 14px;
+}
+QListWidget#sidebar::item:selected {
+    background: #e8f0fe;
+    color: #2f6fed;
+    border-left: 3px solid #2f6fed;
+}
+QGroupBox {
+    background: #ffffff;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    margin-top: 10px;
+    padding: 12px;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    left: 12px;
+    padding: 0 4px;
+    color: #5b6472;
+}
+QPushButton {
+    background: #2f6fed;
+    color: #ffffff;
+    border: none;
+    border-radius: 6px;
+    padding: 6px 14px;
+}
+QPushButton:hover {
+    background: #245bd0;
+}
+QPushButton:disabled {
+    background: #c7d2e5;
+}
+QLineEdit, QSpinBox, QComboBox, QPlainTextEdit {
+    background: #ffffff;
+    border: 1px solid #d8dee8;
+    border-radius: 6px;
+    padding: 5px 8px;
+}
+QLineEdit:focus, QSpinBox:focus, QComboBox:focus, QPlainTextEdit:focus {
+    border-color: #2f6fed;
+}
+QPlainTextEdit {
+    font-family: Consolas, "Cascadia Mono", monospace;
+    font-size: 12px;
+}
+QTableWidget, QListWidget {
+    background: #ffffff;
+    border: 1px solid #e5e7eb;
+    border-radius: 6px;
+}
