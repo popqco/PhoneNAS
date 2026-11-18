@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import re
 from datetime import datetime
+from urllib.parse import quote
 
 from PySide6.QtCore import QObject, QTimer, Signal
 
@@ -74,16 +76,29 @@ class MountSupervisor(QObject):
         QTimer.singleShot(500, self.start)
 
     # -- internals --------------------------------------------------------
+    @staticmethod
+    def _redact(message: object, password: str) -> str:
+        text = str(message)
+        if password:
+            for secret in (password, quote(password, safe="")):
+                text = text.replace(secret, "[密码已隐藏]")
+        return re.sub(r"(?i)(https?://)[^\s/@]+@", r"\1[凭据已隐藏]@", text)
+
     def _spawn(self) -> None:
         if not self._want_mounted:
             return
-        self.rclone.ensure_conf()
+        password = ""
+        try:
+            password = self.config.password
+            self.rclone.write_conf(self.config.url, self.config.username, password)
+        except Exception as exc:
+            self.log_line.emit(f"无法准备挂载配置：{self._redact(exc, password)}")
+            self._schedule_retry()
+            return
         args = [
             "mount",
             f"{C.DEFAULT_REMOTE}:",
             self.drive,
-            "--vfs-cache-mode",
-            "writes",
             "--volname",
             "PhoneNAS",
             "--dir-cache-time",
@@ -93,6 +108,10 @@ class MountSupervisor(QObject):
             "--stats",
             "0",
         ]
+        if self.config.get("mount.read_only", True):
+            args.append("--read-only")
+        else:
+            args.extend(("--vfs-cache-mode", "writes"))
         if self.config.get("mount.network_mode", False):
             args.append("--network-mode")
         log_path = data_dir() / "logs" / f"mount-{datetime.now():%Y%m%d}.log"
@@ -100,7 +119,7 @@ class MountSupervisor(QObject):
             self._proc = self.rclone.popen(args, log_path=log_path)
         except Exception as exc:  # noqa: BLE001
             self._set_state("error")
-            self.log_line.emit(f"挂载启动失败: {exc}")
+            self.log_line.emit(f"挂载启动失败: {self._redact(exc, password)}")
             self._schedule_retry()
             return
         self._set_state("starting")
@@ -119,6 +138,7 @@ class MountSupervisor(QObject):
             return
         # process exited
         self._poll_timer.stop()
+        self.rclone.release(self._proc)
         self._proc = None
         if not self._want_mounted:
             self._set_state("stopped")
@@ -142,16 +162,20 @@ class MountSupervisor(QObject):
     def _kill_proc(self) -> None:
         proc = self._proc
         self._proc = None
-        if proc is None or proc.poll() is not None:
+        if proc is None:
             return
         try:
-            proc.terminate()
-            proc.wait(timeout=5)
+            if proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=5)
         except Exception:  # noqa: BLE001
             try:
                 proc.kill()
+                proc.wait(timeout=5)
             except Exception:  # noqa: BLE001
                 pass
+        finally:
+            self.rclone.release(proc)
 
     def _set_state(self, state: str) -> None:
         if state != self._state:

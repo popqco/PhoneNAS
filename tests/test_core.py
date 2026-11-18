@@ -5,11 +5,13 @@ import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from dataclasses import replace
 
 from app import constants as C
 from app.core.config import Config
 from app.core.retention import old_versions, parse_version_name
 from app.core.sync import build_sync_args
+from app.core.tasks import new_task
 
 
 class ConfigTests(unittest.TestCase):
@@ -18,12 +20,13 @@ class ConfigTests(unittest.TestCase):
             path = Path(tmp) / "config.json"
             config = Config(path)
             self.assertEqual(config.url, C.DEFAULT_URL)
-            config.set("mirror.local_path", r"D:\TestFolder")
+            task = new_task(r"D:\TestFolder")
+            config.upsert_task(task)
             config.password = "secret"
             config.save()
 
             loaded = Config(path)
-            self.assertEqual(loaded.local_path, Path(r"D:\TestFolder"))
+            self.assertEqual(loaded.get_task(task.id).local_path, r"D:\TestFolder")
             self.assertEqual(loaded.password, "secret")
 
     def test_export_strips_password(self) -> None:
@@ -75,16 +78,15 @@ class RetentionTests(unittest.TestCase):
 class SyncArgsTests(unittest.TestCase):
     def test_args_contain_backup_dir_and_excludes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            config = Config(Path(tmp) / "config.json")
-            config.set("mirror.local_path", r"D:\Work")
-            config.set("mirror.remote_path", "backup/work")
-            config.set("mirror.versions_path", "backup/work-versions")
-            config.set("mirror.excludes", ["build/**", "*.tmp"])
-            args = build_sync_args(config, "2026-11-14_153000")
+            task = replace(
+                new_task(r"D:\Work"), remote_path="backup/work/mirror",
+                versions_path="backup/work/versions", excludes=("build/**", "*.tmp"),
+            )
+            args = build_sync_args(task, "2026-11-14_153000")
             self.assertEqual(args[0], "sync")
-            self.assertIn("phone:backup/work", args)
+            self.assertIn("phone:backup/work/mirror", args)
             self.assertIn("--backup-dir", args)
-            self.assertIn("phone:backup/work-versions/2026-11-14_153000", args)
+            self.assertIn("phone:backup/work/versions/2026-11-14_153000", args)
             self.assertIn("build/**", args)
             self.assertIn("*.tmp", args)
 

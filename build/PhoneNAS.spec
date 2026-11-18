@@ -6,6 +6,7 @@ ROOT = Path(SPECPATH).resolve().parent
 datas = [
     (str(ROOT / "app" / "ui" / "style.qss"), "app/ui"),
     (str(ROOT / "app" / "resources" / "app.ico"), "app/resources"),
+    (str(ROOT / "app" / "resources" / "icons"), "app/resources/icons"),
     (str(ROOT / "vendor" / "rclone.exe"), "vendor"),
     (str(ROOT / "vendor" / "winfsp.msi"), "vendor"),
 ]

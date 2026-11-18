@@ -4,6 +4,10 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
+import threading
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -39,33 +43,79 @@ class Result:
 
 
 class Rclone:
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, conf_path: Path | None = None):
         self.config = config
         self.log = get_logger()
-        self.conf_path = data_dir() / "rclone.conf"
+        self.conf_path = Path(conf_path) if conf_path is not None else data_dir() / "rclone.conf"
+        self._cancelled = threading.Event()
+        self._lock = threading.Lock()
+        self._processes: set[subprocess.Popen] = set()
+
+    @contextmanager
+    def isolated_conf(self):
+        """Use a private configuration for this operation, never the mount's file."""
+        original = self.conf_path
+        with tempfile.TemporaryDirectory(prefix="PhoneNAS-connection-") as root:
+            self.conf_path = Path(root) / "rclone.conf"
+            try:
+                yield self
+            finally:
+                self.conf_path = original
+
+    def cancel(self) -> None:
+        self._cancelled.set()
+        with self._lock:
+            processes = tuple(self._processes)
+        for proc in processes:
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+            except OSError:
+                pass
 
     # -- process ----------------------------------------------------------
-    def run(self, args: list[str], timeout: int = 120, conf_path: Path | None = None) -> Result:
+    def run(
+        self, args: list[str], timeout: int = 120, conf_path: Path | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> Result:
+        if self._cancelled.is_set() or (cancel_event and cancel_event.is_set()):
+            return Result(False, "", "操作已取消", -1)
         exe = rclone_exe()
         if not exe.exists():
             return Result(False, "", f"找不到 rclone: {exe}", -1)
         conf = conf_path or self.conf_path
         cmd = [str(exe), *args, "--config", str(conf)]
+        proc = None
         try:
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=timeout,
-                creationflags=CREATE_NO_WINDOW,
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", errors="replace",
+                creationflags=CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
-            return Result(proc.returncode == 0, proc.stdout, proc.stderr, proc.returncode)
-        except subprocess.TimeoutExpired:
-            return Result(False, "", f"rclone 超时（{timeout}s）", -1)
+            with self._lock:
+                self._processes.add(proc)
+            deadline = time.monotonic() + timeout
+            while True:
+                cancelled = self._cancelled.is_set() or (cancel_event and cancel_event.is_set())
+                if cancelled or time.monotonic() >= deadline:
+                    proc.kill()
+                    out, err = proc.communicate()
+                    message = "操作已取消" if cancelled else f"rclone 超时（{timeout}s）"
+                    return Result(False, out, message + (f"\n{err}" if err else ""), -1)
+                try:
+                    out, err = proc.communicate(timeout=min(0.2, max(0.01, deadline-time.monotonic())))
+                    return Result(proc.returncode == 0, out, err, proc.returncode)
+                except subprocess.TimeoutExpired:
+                    continue
         except Exception as exc:  # noqa: BLE001
             return Result(False, "", str(exc), -1)
+        finally:
+            if proc is not None:
+                with self._lock:
+                    self._processes.discard(proc)
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.communicate()
 
     def popen(self, args: list[str], log_path: Path | None = None, conf_path: Path | None = None) -> subprocess.Popen:
         exe = rclone_exe()
@@ -77,18 +127,30 @@ class Rclone:
         if log_path:
             log_path.parent.mkdir(parents=True, exist_ok=True)
             stream = open(log_path, "a", encoding="utf-8", errors="replace")
-        proc = subprocess.Popen(
-            cmd,
-            stdout=stream or subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            creationflags=CREATE_NO_WINDOW,
-        )
+        try:
+            if self._cancelled.is_set():
+                raise RuntimeError("操作已取消")
+            proc = subprocess.Popen(
+                cmd, stdout=stream or subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace",
+                creationflags=CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
+        except Exception:
+            if stream is not None:
+                stream.close()
+            raise
+        with self._lock:
+            self._processes.add(proc)
         if stream is not None:
             proc._phonenas_log = stream  # type: ignore[attr-defined]
         return proc
+
+    def release(self, proc: subprocess.Popen) -> None:
+        with self._lock:
+            self._processes.discard(proc)
+        stream = getattr(proc, "_phonenas_log", None)
+        if stream is not None:
+            stream.close()
 
     def obscure(self, password: str) -> str:
         if not password:
@@ -102,6 +164,8 @@ class Rclone:
         self._write_conf(self.conf_path, url, username, password)
 
     def _write_conf(self, path: Path, url: str, username: str, password: str) -> None:
+        if any(c in str(value) for value in (url, username, password) for c in ("\r", "\n", "\0")):
+            raise ValueError("连接信息不能包含换行或控制字符")
         obscured = self.obscure(password)
         lines = [
             f"[{C.DEFAULT_REMOTE}]",
@@ -130,23 +194,22 @@ class Rclone:
         return first[0] if first else "unknown"
 
     # -- operations -------------------------------------------------------
-    def test_connection(self, url: str, username: str, password: str) -> Result:
-        exe = rclone_exe()
-        if not exe.exists():
-            return Result(False, "", f"找不到 rclone: {exe}", -1)
-        tmp_conf = data_dir() / "rclone.test.conf"
+    def test_connection(
+        self, url: str, username: str, password: str,
+        cancel_event: threading.Event | None = None,
+    ) -> Result:
+        if cancel_event and cancel_event.is_set():
+            return Result(False, "", "操作已取消", -1)
         try:
-            self._write_conf(tmp_conf, url, username, password)
-            return self.run(
-                ["lsd", f"{C.DEFAULT_REMOTE}:", "--max-depth", "1", "--timeout", "20s"],
-                timeout=35,
-                conf_path=tmp_conf,
-            )
-        finally:
-            try:
-                tmp_conf.unlink()
-            except OSError:
-                pass
+            with self.isolated_conf():
+                self._write_conf(self.conf_path, url, username, password)
+                return self.run(
+                    ["lsd", f"{C.DEFAULT_REMOTE}:", "--max-depth", "1", "--timeout", "20s",
+                     "--contimeout", "10s", "--retries", "1", "--low-level-retries", "1"],
+                    timeout=35, cancel_event=cancel_event,
+                )
+        except Exception as exc:  # noqa: BLE001
+            return Result(False, "", str(exc), -1)
 
     def mkdir(self, remote_path: str) -> Result:
         return self.run(["mkdir", f"{C.DEFAULT_REMOTE}:{remote_path}"], timeout=60)
