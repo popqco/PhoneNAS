@@ -10,20 +10,17 @@ Windows 10/11 x64 · Python + PySide6 · rclone · WinFsp · 无广告
 
 扫描失败时指出本地或手机目录、具体相对路径和问题字符码位；不再把工作文件的名称问题笼统称为“历史文件路径无效”。差异列表将不可见字符显示为 `<U+XXXX>`，实际传输仍使用原名。升级不重置任务、基线或锁，不自动上传。
 
+**下载 1.2.3：** [安装包](https://github.com/popqco/PhoneNAS/releases/download/v1.2.3/PhoneNAS-Setup-1.2.3.exe) · [便携版](https://github.com/popqco/PhoneNAS/releases/download/v1.2.3/PhoneNAS-portable-1.2.3.zip) · [SHA-256](https://github.com/popqco/PhoneNAS/releases/download/v1.2.3/SHA256-1.2.3.txt) · [Release](https://github.com/popqco/PhoneNAS/releases/tag/v1.2.3)
+
 ## 1.2.2：进度对应实际阶段
 
 上传和下载明确区分 **暂存、内容复核、写入目标、保留旧文件、补齐目录和最终校验**。字节百分比只表示当前复制阶段，不代表整个任务完成；例如“下载到暂存区 · 本阶段 100%”时，接收目录可能仍未写入。
 
 进入校验或收尾后立即清除上一阶段百分比，显示当前阶段及已用时；目录处理显示实际核对数量。只有完成内容验证、保存结果并释放任务锁后，才报告任务完成。减少对已存在或已由成功复制创建的目录重复启动 rclone，不减少完整 SHA256 复核、不改变基线或冲突保护。
 
-## Android 手机端：独立 0.4.2 candidate
+## Android 手机端：独立候选，未包含在本次发布
 
-已补齐多个内置公共共享、每项只读/读写、原生后台恢复与固定VPN地址的HTTPS，保留官方Tailscale，不依赖Termux或电脑看门狗。当前vivo真机已验证公共共享/真实TLS访问、有限崩溃恢复、停止保锁、正常整机重启自动恢复和既有客户端隔离接力；无调试入口candidate也已正常覆盖安装。**没有切换旧手机服务或迁移工作数据；连续72小时已于2026-11-15 18:39（+08）在手机独立开始，最早11月18日18:39终验，最终可靠性门槛仍未全部完成，不把局部通过称为可靠正式版。** 失败、平台限制及未测范围均保留。
-
-- [需求规格](docs/ANDROID-SERVER-SPEC.md)、[验证状态与门槛](docs/ANDROID-SERVER-VALIDATION.md)。
-- [可点击页面原型](android/prototype/index.html)：本地双击打开；模拟数据，不会连接或修改手机。
-- [Android候选版](android/README.md)、[手机端使用说明](docs/ANDROID-USER-GUIDE.md)、[0.4实际验证](docs/ANDROID-DEBUG-0.4-VALIDATION.md)、[交付完成审计](docs/ANDROID-DELIVERY-AUDIT.md)。
-- [0.3历史调试](docs/ANDROID-DEBUG-0.3-VALIDATION.md)、[0.2真机基线](docs/ANDROID-DEBUG-0.2-VALIDATION.md)、[旧WebDAV候选合同](android/davcore/README.md)保留失败证据；不降低独占锁和中断写入要求来适配。
+手机端 `com.phonenas.server.probe` 0.4.2 候选版已在本台 vivo 完成插电熄屏 72 小时试运行（实际约 73 小时 12 分，正常停止，运行记录无故障或观测空白），但不代表全程远端持续可达或正式发行。该手机端与本次桌面 1.2.3 发布相互独立，相关源码、安装包和验收记录暂未纳入本仓库。
 
 下面仍是现有 Windows 客户端的使用说明；新增规划不改变其连接、同步规则或已有数据。
 
@@ -52,12 +49,17 @@ Windows 10/11 x64 · Python + PySide6 · rclone · WinFsp · 无广告
 
 ## 下载安装
 
-已发布版本见 [Releases](https://github.com/popqco/PhoneNAS/releases/latest)。本地构建不代表已发布、已安装或已切换现有任务。
+当前版本 **1.2.3**：[Release v1.2.3](https://github.com/popqco/PhoneNAS/releases/tag/v1.2.3) · [全部版本](https://github.com/popqco/PhoneNAS/releases)。安装包与便携版均为本仓库 Release 附件，下载后可用 SHA-256 校验。
 
 | 文件 | 用途 |
 | --- | --- |
 | `PhoneNAS-Setup-1.2.3.exe` | 安装包，可选目录、快捷方式及登录自启 |
 | `PhoneNAS-portable-1.2.3.zip` | 便携版，解压即用，配置写 EXE 旁的 `data\` |
+
+```text
+b899f5fb96461bfc01d33b9aa4cf674872ee4e2fa5d8db5b1cd1c4ff778c1279  PhoneNAS-Setup-1.2.3.exe
+b045ea26c94c788339fe43a360f4e18c4e7fd92f8c73dd3c4521dac75be3741f  PhoneNAS-portable-1.2.3.zip
+```
 
 挂载需 WinFsp；可在设置中手动安装内置 MSI，一次管理员确认。**仅使用同步不需安装挂载驱动。** 手机 WebDAV 与跨网连接（例如 Tailscale）需自行准备。
 
