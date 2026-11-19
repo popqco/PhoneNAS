@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import json
 import re
-from pathlib import Path
 
-from app.core.relay import BaselineStore, ContentSnapshot, _atomic_json, _no_links, _read_file
+from app.core.filenames import LEGACY, LITERAL
+from app.core.relay import BaselineStore, ContentSnapshot, _atomic_json, _json, _no_links, _read_file
 
 
 class PendingOperation:
@@ -16,13 +15,14 @@ class PendingOperation:
 
     def load(self) -> dict | None:
         try:
-            value = json.loads(_read_file(self.path))
+            value = _json(_read_file(self.path))
         except FileNotFoundError:
             return None
-        except (OSError, ValueError, UnicodeError) as exc:
+        except (OSError, ValueError, UnicodeError, RuntimeError) as exc:
             raise RuntimeError("未完成操作记录不可读；请先保留两端文件并人工核对。") from exc
         try:
-            if not isinstance(value, dict) or value.get("version") != 1 or value.get("binding") != self.binding:
+            if (type(value) is not dict or type(value.get("version")) is not int
+                    or value["version"] not in (LEGACY, LITERAL) or value.get("binding") != self.binding):
                 raise ValueError("操作身份已变化")
             if value["operation"] not in ("publish", "receive", "return", "adopt"):
                 raise ValueError("无效操作")
@@ -39,7 +39,7 @@ class PendingOperation:
                             "generation", "phase", "content_digest"}
                 if (type(previous) is not dict or not required.issubset(previous)
                         or set(previous) - required - {"writer_identity"}
-                        or type(previous["version"]) is not int or previous["version"] != 1
+                        or type(previous["version"]) is not int or previous["version"] != value["version"]
                         or previous["phase"] != "ready"
                         or any(previous[key] != self.binding[key] for key in
                                ("dataset_id", "remote_path", "versions_path", "excludes"))
@@ -53,9 +53,14 @@ class PendingOperation:
         return value
 
     def save(self, *, operation: str, local: ContentSnapshot, remote: ContentSnapshot,
-             generation: str, stamp: str, lock_token: str, prior_metadata: dict | None = None) -> None:
+             generation: str, stamp: str, lock_token: str, prior_metadata: dict | None = None,
+             protocol: int = LEGACY) -> None:
+        if type(protocol) is not int or protocol not in (LEGACY, LITERAL):
+            raise ValueError("无效的文件名协议")
+        if prior_metadata is not None and prior_metadata.get("version") != protocol:
+            raise ValueError("未完成操作的文件名协议与发布状态不一致")
         _atomic_json(self.path, {
-            "version": 1, "binding": self.binding, "operation": operation,
+            "version": protocol, "binding": self.binding, "operation": operation,
             "local": local.to_dict(), "remote": remote.to_dict(),
             "generation": generation, "stamp": stamp, "lock_token": lock_token,
             "prior_metadata": prior_metadata,

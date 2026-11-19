@@ -4,15 +4,13 @@ import os
 import uuid
 from dataclasses import replace
 from datetime import datetime
-from pathlib import Path
 from time import monotonic
 
 from PySide6.QtCore import QSize, QTimer, Qt
 from PySide6.QtGui import QAction, QCloseEvent, QIcon
 from PySide6.QtWidgets import (
     QApplication, QDialog, QFrame, QHBoxLayout, QListWidget, QListWidgetItem,
-    QMainWindow, QMenu, QMessageBox, QScrollArea, QSizePolicy, QStackedWidget,
-    QSystemTrayIcon, QVBoxLayout, QWidget,
+    QMainWindow, QMenu, QMessageBox, QStackedWidget, QSystemTrayIcon, QVBoxLayout, QWidget,
 )
 
 from app import constants as C
@@ -32,8 +30,14 @@ from app.ui.pages.status import StatusPage
 from app.ui.pages.versions import VersionsPage
 from app.ui.preview_dialog import PreviewDialog
 from app.ui.task_dialog import MultiFolderDialog, TaskDialog
-from app.ui.widgets import Badge, ElidedLabel, IconBox, button, icon, label
+from app.ui.widgets import Badge, IconBox, icon, label
 from app.ui.wizard import WizardDialog
+
+
+_SCHEDULE_APPROVAL = "1.2.4-filenames"
+_SCHEDULE_NOTICE = "文件名校验规则已更新，自动计划已暂停。请先核对任务差异，再点击「继续自动计划」。"
+_SYNC_ALL_TEXT = "逐项核对并同步"
+_SYNC_ALL_TIP = "依次查看各个已启用任务的差异；确认后才执行，关闭预演会跳过该项。"
 
 
 class MainWindow(QMainWindow):
@@ -48,14 +52,14 @@ class MainWindow(QMainWindow):
         self.sync_worker: SyncWorker | None = None
         self.states: dict[str, dict] = {}
         self.events: list[dict] = []
-        self._preview_results: dict[str, tuple[SyncReport, str]] = {}
-        self._approvals: dict[str, str] = {}
-        self._worker_result: tuple[str, object] | None = None
+        self._preview_result: tuple[SyncReport, str] | None = None
         self._settings_pending = False
         self._connection_signature = self._connection_settings()
         self._tray_hint_shown = False
         self._quitting = False
         self._wizard: QDialog | None = None
+        self._first_run = first_run and not config.path.exists()
+        self._enforce_schedule_approval()
         self.setWindowTitle(f"{C.APP_NAME} {C.APP_VERSION}" + (" · 界面检查（不连接手机）" if not operational else ""))
         self.resize(1320, 880)
         self.setMinimumSize(780, 520)
@@ -79,13 +83,12 @@ class MainWindow(QMainWindow):
         self._quit_timer.timeout.connect(self._finish_quit)
         if operational:
             if config.load_error:
-                QTimer.singleShot(200, lambda: self._message("配置需要处理", config.load_error, warning=True))
-            elif first_run:
-                QTimer.singleShot(250, self.open_wizard)
+                QTimer.singleShot(200, self, self._show_config_error)
+            elif self._first_run:
+                QTimer.singleShot(250, self, self.open_wizard)
             else:
-                if self.config.get("mount.enabled", True) and self.config.get("mount.auto_mount", True):
-                    QTimer.singleShot(400, self.mount.start)
-                QTimer.singleShot(2500, self.scheduler.start)
+                QTimer.singleShot(400, self, self._start_automatic_mount)
+                QTimer.singleShot(2500, self, self._start_scheduler)
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -158,6 +161,11 @@ class MainWindow(QMainWindow):
         if not self.operational:
             top_layout.addWidget(Badge("界面检查 · 不连接手机", "blue"))
         body_layout.addWidget(top)
+        self._schedule_notice = label(_SCHEDULE_NOTICE, "bodyMuted")
+        self._schedule_notice.setWordWrap(True)
+        body_layout.addWidget(self._schedule_notice)
+        self.status_page.sync_button.setText(_SYNC_ALL_TEXT)
+        self.status_page.sync_button.setToolTip(_SYNC_ALL_TIP)
         body_layout.addWidget(self.stack, 1)
         layout.addWidget(sidebar)
         layout.addWidget(body, 1)
@@ -176,9 +184,9 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         actions = [
             ("打开主界面", self.show_window),
-            ("同步全部启用任务", self.run_sync),
+            (_SYNC_ALL_TEXT, self.run_sync),
             ("挂载 / 卸载", self.toggle_mount),
-            ("暂停 / 继续计划", self.toggle_pause),
+            ("暂停 / 继续自动计划", self.toggle_pause),
         ]
         for text, slot in actions:
             action = QAction(text, self)
@@ -230,22 +238,65 @@ class MainWindow(QMainWindow):
     def _message(self, title: str, text: str, *, warning: bool = False) -> None:
         (QMessageBox.warning if warning else QMessageBox.information)(self, title, text)
 
+    def _can_start(self) -> bool:
+        return self.operational and not self._quitting and not self.config.load_error
+
     def _allowed(self) -> bool:
+        if self._quitting:
+            return False
         if not self.operational:
             self.statusBar().showMessage("界面检查模式：此操作不会连接手机或修改真实配置。")
             return False
         if self.config.load_error:
             self._message("配置无效", self.config.load_error, warning=True)
             return False
-        return not self._quitting
+        return True
 
-    def _exec_dialog(self, dialog: QDialog) -> bool:
-        self._wizard = dialog
+    @property
+    def _schedule_approved(self) -> bool:
+        return self.config.get("app.schedule_approval", "") == _SCHEDULE_APPROVAL
+
+    def _enforce_schedule_approval(self) -> None:
+        if self.operational and not self._schedule_approved:
+            self.scheduler.queue.pause()
+
+    def _save_schedule_approval(self) -> bool:
+        previous = self.config.get("app.schedule_approval", "")
         try:
-            return dialog.exec() == QDialog.DialogCode.Accepted
+            self.config.set("app.schedule_approval", _SCHEDULE_APPROVAL)
+            self.config.save()
+        except Exception as exc:
+            self.config.set("app.schedule_approval", previous)
+            self._message("未能继续自动计划", f"确认未能保存，自动计划仍已暂停：{exc}", warning=True)
+            return False
+        return True
+
+    def _start_scheduler(self) -> None:
+        if self._can_start() and not self.scheduler._started:
+            self._enforce_schedule_approval()
+            self.scheduler.start()
+
+    def _start_mount(self) -> None:
+        if self._can_start() and self.config.get("mount.enabled", True):
+            self.mount.start()
+
+    def _start_automatic_mount(self) -> None:
+        if self.config.get("mount.auto_mount", True):
+            self._start_mount()
+
+    def _show_config_error(self) -> None:
+        if self.operational and not self._quitting and self.config.load_error:
+            self._message("配置需要处理", self.config.load_error, warning=True)
+
+    def _exec_dialog(self, dialog: QDialog, *, accepted_code: int = QDialog.DialogCode.Accepted) -> bool:
+        self._wizard = dialog
+        self._set_operation_gates()
+        try:
+            return dialog.exec() == accepted_code
         finally:
             self._wizard = None
-            QTimer.singleShot(0, self._dispatch)
+            self._set_operation_gates()
+            QTimer.singleShot(0, self, self._dispatch)
 
     def _editable(self) -> bool:
         if not self._allowed():
@@ -291,8 +342,6 @@ class MainWindow(QMainWindow):
             draft.upsert_task(task)
             draft.save()
             self.config.apply_snapshot(draft)
-            self._preview_results.pop(task.id, None)
-            self._approvals.pop(task.id, None)
             self._reload_tasks()
             self._event(task.name, "任务设置已保存", "settings")
         except Exception as exc:
@@ -353,28 +402,34 @@ class MainWindow(QMainWindow):
         self._event(task.name, "已移除任务配置，手机文件保留", "folders")
 
     def _reload_tasks(self) -> None:
+        self._enforce_schedule_approval()
         self.scheduler.update_tasks(self.config.tasks if self.config.get("mirror.enabled", True) else ())
-        if self.operational and not self._quitting and not self.config.load_error and not self.scheduler._started:
-            self.scheduler.start()
+        self._start_scheduler()
         self.mirror_page.load()
         self.versions_page.load_tasks()
         self.refresh_status()
 
-    def run_sync(self, task_id: str | None = None, manual: bool = True) -> None:
+    def run_sync(self, task_id: str | None = None) -> None:
         if not self._allowed():
             return
         if not self.config.get("mirror.enabled", True):
             self._message("计划已禁用", "全局同步未启用，请先在设置中启用。")
             return
-        if task_id is not None:
+        if task_id is None:
+            if not self.isVisible() or self.isMinimized():
+                self.show_window()
+            if self.busy:
+                self.statusBar().showMessage("请等当前操作完成，再逐项核对并同步。")
+                return
+            if not any(task.enabled for task in self.config.tasks):
+                self.statusBar().showMessage("没有已启用的任务，请先添加或启用任务。")
+                return
+        else:
             task = self.config.get_task(task_id)
             if task is None or not task.enabled:
                 self._message("任务已暂停", "请先启用该任务，再执行同步。")
                 return
-        if task_id is None and not any(task.enabled for task in self.config.tasks):
-            self.statusBar().showMessage("没有已启用的任务，请先添加或启用任务。")
-            return
-        self.scheduler.request(task_id, manual=manual)
+        self.scheduler.request(task_id, manual=True)
         self.refresh_status()
 
     def preview_task(self, task_id: str) -> None:
@@ -402,45 +457,54 @@ class MainWindow(QMainWindow):
             return
         self._launch(task, preview_only=True, operation=operation)
 
+    def _can_cancel(self, worker: SyncWorker, task_id: str) -> bool:
+        return (
+            self.operational and not self._quitting and self.sync_worker is worker
+            and worker.task.id == task_id and self.states.get(task_id, {}).get("state") in ("running", "preview")
+            and worker.outcome == "pending" and worker.isRunning()
+        )
+
     def cancel_task(self, task_id: str) -> None:
         worker = self.sync_worker
-        if worker is None or worker.task.id != task_id or not self.operational:
+        if worker is None or not self._can_cancel(worker, task_id):
             return
         answer = QMessageBox.question(
             self, "取消本次操作", "停止当前操作？已经传输的文件不回滚，未完成的操作不会记录为成功，也不会清理历史文件。",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
-        if answer != QMessageBox.StandardButton.Yes:
+        # The modal loop may have delivered a result, started another worker or begun shutdown.
+        if answer != QMessageBox.StandardButton.Yes or not self._can_cancel(worker, task_id):
+            return
+        if worker.stop() is False:
             return
         self.states[task_id] = {"state": "cancelling", "message": "正在取消；等待传输进程退出…", "progress": None}
         self._progress_timer.stop()
         self.statusBar().showMessage(self.states[task_id]["message"])
-        worker.stop()
         self.refresh_status()
 
     def _dispatch(self) -> None:
-        if not self.operational or self._quitting or self.busy or self.config.load_error or not self.config.get("mirror.enabled", True):
+        if not self._can_start() or self.busy or not self.config.get("mirror.enabled", True):
             return
-        task_id = self.scheduler.queue.take_next()
-        if task_id is None:
+        request = self.scheduler.queue.take_next_request()
+        if request is None:
             self.refresh_status()
             return
+        task_id, manual = request
         task = self.config.get_task(task_id)
         if task is None or not task.enabled:
             self.scheduler.complete(task_id)
             return
-        self._launch(task)
+        self._launch(task, preview_only=manual)
 
     def _launch(self, task: MirrorTask, *, preview_only: bool = False, operation: str = "", approved_digest: str = "") -> None:
         self._progress_timer.stop()
-        self._preview_results.pop(task.id, None)
+        self._preview_result = None
         worker = SyncWorker(
             self.config, task, self, preview_only=preview_only, operation=operation,
-            approved_digest=approved_digest or ("" if preview_only else self._approvals.pop(task.id, "")),
+            approved_digest=approved_digest,
         )
         self.sync_worker = worker
-        self._worker_result = None
         self.states[task.id] = {"state": "preview" if preview_only else "running", "message": "正在校验差异…", "progress": None, "operation": worker.operation}
         self.statusBar().showMessage(self.states[task.id]["message"])
         worker.progress.connect(self._on_progress)
@@ -525,61 +589,62 @@ class MainWindow(QMainWindow):
     def _on_guarded(self, task_id: str, report: SyncReport, reason: str) -> None:
         self._progress_timer.stop()
         self.states[task_id] = {"state": "guarded", "message": reason, "progress": None, "operation": report.operation}
-        self._preview_results[task_id] = (report, reason)
         self.statusBar().showMessage(reason)
         task = self.config.get_task(task_id)
-        self._event(task.name if task else task_id, "保护已阻止自动执行", "shield", reason)
+        self._event(task.name if task else task_id, "保护已阻止执行", "shield", reason)
 
     def _on_preview(self, task_id: str, report: SyncReport, reason: str) -> None:
+        worker = self.sync_worker
+        if worker is None or worker.task.id != task_id or not worker.preview_only:
+            return
         self._progress_timer.stop()
         message = f"差异核对完成 · {report.summary}"
         self.states[task_id] = {"state": "guarded" if reason else "idle", "message": reason if report.blocked else message, "progress": None, "operation": report.operation}
         self.statusBar().showMessage(reason if report.blocked else message)
-        self._preview_results[task_id] = (report, reason)
-        self._worker_result = (task_id, report)
+        self._preview_result = (report, reason)
         self.refresh_status()
+
+    def _confirm_preview(self, task: MirrorTask, operation: str, report: SyncReport, reason: str) -> bool:
+        dialog = PreviewDialog(task, report, reason, self, operation=operation)
+        if not self._exec_dialog(dialog) or report.blocked or not self._can_start():
+            return False
+        if (not report.digest or (operation != "recover" and report.operation != operation)
+                or not task.enabled or self.config.get_task(task.id) != task or self._settings_pending
+                or self.busy or not self.config.get("mirror.enabled", True)):
+            self.statusBar().showMessage("任务或差异已变化，请重新核对后再执行。")
+            return False
+        queue = self.scheduler.queue
+        if queue.active_id != task.id and not queue.claim(task.id):
+            self.statusBar().showMessage("任务状态已变化，请重新核对后再执行。")
+            return False
+        # The digest authorizes only this worker. Its fresh scan must match before applying.
+        self._launch(task, operation=operation, approved_digest=report.digest)
+        return True
 
     def _on_worker_finished(self) -> None:
         worker = self.sync_worker
         if worker is None:
             return
-        task_id = worker.task.id
+        task = worker.task
         preview_only = worker.preview_only
         operation = worker.operation
+        preview_result = self._preview_result
+        self._preview_result = None
         self._progress_timer.stop()
-        state = self.states.get(task_id, {})
+        state = self.states.get(task.id, {})
         state.pop("progress_event", None)
         state.pop("phase_started_at", None)
         self.sync_worker = None
         worker.deleteLater()
-        if not preview_only:
-            self.scheduler.complete(task_id)
+        if preview_only:
+            if (preview_result is not None and self._can_start() and self.config.get_task(task.id) == task
+                    and self._confirm_preview(task, operation, *preview_result)):
+                return  # Keep the slot until the confirmed write finishes.
+            self.scheduler.queue.skip_preview(task.id)
+        else:
+            self.scheduler.complete(task.id)
             self.mirror_page.load()
-        self._set_operation_gates()
-        self.refresh_status()
-        if self._quitting:
-            return
-        if preview_only and task_id in self._preview_results:
-            report, reason = self._preview_results[task_id]
-            task = self.config.get_task(task_id)
-            if task is not None:
-                dialog = PreviewDialog(task, report, reason, self, operation=operation)
-                # Keep the dispatcher gated while the user reviews a modal decision.
-                self._wizard = dialog
-                try:
-                    accepted = dialog.exec() == QDialog.DialogCode.Accepted
-                finally:
-                    self._wizard = None
-                if accepted and not report.blocked and not self._quitting and self.operational:
-                    if operation in ("return", "adopt", "recover"):
-                        if self.scheduler.queue.claim(task_id):
-                            self._launch(task, operation=operation, approved_digest=report.digest)
-                        else:
-                            self.statusBar().showMessage("任务状态已变化，请重新核对接力操作。")
-                    else:
-                        self._approvals[task_id] = report.digest
-                        self.run_sync(task_id)
-        QTimer.singleShot(0, self._dispatch)
+        self._operation_finished()
 
     def show_history(self, task_id: str) -> None:
         self.versions_page.select_task(task_id)
@@ -593,10 +658,10 @@ class MainWindow(QMainWindow):
             self._apply_settings()
         self._set_operation_gates()
         self.refresh_status()
-        QTimer.singleShot(0, self._dispatch)
+        QTimer.singleShot(0, self, self._dispatch)
 
     def _set_operation_gates(self) -> None:
-        syncing = self.sync_worker is not None or self._quitting
+        syncing = self.sync_worker is not None or self._wizard is not None or self._quitting
         self.settings_page.set_sync_busy(syncing or self.versions_page.busy)
         self.versions_page.set_sync_busy(syncing or self.settings_page.busy)
         self.mirror_page.set_interaction_busy(self.busy or self._quitting)
@@ -613,35 +678,35 @@ class MainWindow(QMainWindow):
 
     def _apply_settings(self) -> None:
         self._settings_pending = False
-        self._approvals.clear()
-        self._preview_results.clear()
+        if not self._can_start():
+            return
         signature = self._connection_settings()
         remount = self.mount.state in ("mounted", "starting", "retrying")
         if signature != self._connection_signature:
             self.mount.stop()
             self._connection_signature = signature
-            if remount and self.operational and self.config.get("mount.enabled", True):
-                QTimer.singleShot(350, self.mount.start)
+            if remount:
+                QTimer.singleShot(350, self, self._start_mount)
         self._reload_tasks()
         self._event("设置", "连接与任务配置已更新", "settings")
 
     def open_wizard(self) -> None:
         if not self._editable():
             return
+        existing = {task.id for task in self.config.tasks}
         dialog = WizardDialog(self.config, self, operational=self.operational)
-        self._wizard = dialog
-        try:
-            accepted = dialog.exec() == QDialog.DialogCode.Accepted
-        finally:
-            self._wizard = None
-        if accepted:
+        if self._exec_dialog(dialog) and self._can_start():
+            # A fresh setup can opt in by explicitly creating an automatic task.
+            # An existing or imported task cannot supply that approval.
+            if self._first_run and not self._schedule_approved and any(
+                task.id not in existing and task.enabled and task.auto_sync for task in self.config.tasks
+            ) and self._save_schedule_approval():
+                self.scheduler.resume()
+            self._first_run = False
             self.settings_page.load()
             self._reload_tasks()
-            self.scheduler.start()
             set_autostart(bool(self.config.get("app.start_with_windows", True)))
-            if self.config.get("mount.enabled", True) and self.config.get("mount.auto_mount", True):
-                self.mount.start()
-        self._set_operation_gates()
+            self._start_automatic_mount()
 
     def toggle_mount(self) -> None:
         if not self._allowed():
@@ -659,7 +724,21 @@ class MainWindow(QMainWindow):
     def toggle_pause(self) -> None:
         if not self._allowed():
             return
-        if self.scheduler.queue.paused:
+        if self.scheduler.paused:
+            if not self._schedule_approved:
+                if self.busy:
+                    self.statusBar().showMessage("请等当前操作完成，再继续自动计划。")
+                    return
+                dialog = QMessageBox(
+                    QMessageBox.Icon.Warning, "继续自动计划",
+                    _SCHEDULE_NOTICE + "\n\n确认后，已到期的自动任务可能立即执行。是否继续？",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, self,
+                )
+                dialog.setDefaultButton(QMessageBox.StandardButton.No)
+                dialog.button(QMessageBox.StandardButton.Yes).setText("继续自动计划")
+                if (not self._exec_dialog(dialog, accepted_code=QMessageBox.StandardButton.Yes.value)
+                        or not self._can_start() or self.busy or not self._save_schedule_approval()):
+                    return
             self.scheduler.resume()
         else:
             self.scheduler.pause()
@@ -700,6 +779,11 @@ class MainWindow(QMainWindow):
             next_runs[task.id] = due.strftime("%H:%M") if due else ""
         last = max((t.last_sync_at for t in self.config.tasks), default="")
         next_run = queue.next_run_at
+        self._schedule_notice.setVisible(
+            self._can_start() and queue.paused and not self._schedule_approved
+            and bool(self.config.get("mirror.enabled", True))
+            and any(task.enabled and task.auto_sync for task in self.config.tasks)
+        )
         self.status_page.set_nas(self.config.url)
         self.status_page.set_winfsp(winfsp.is_installed())
         self.status_page.set_mount(self.mount.state, self.mount.drive)
@@ -749,6 +833,7 @@ class MainWindow(QMainWindow):
             self.sync_worker.stop()
         self.settings_page.shutdown()
         self.versions_page.shutdown()
+        self.mount.stop()  # Disarm retries even while other workers are still finishing.
         self._quit_timer.start()
         self._finish_quit()
 
@@ -764,7 +849,6 @@ class MainWindow(QMainWindow):
             self._wizard.reject()
             return
         self._quit_timer.stop()
-        self.mount.stop()
         if self.tray:
             self.tray.hide()
         self.close()

@@ -11,9 +11,10 @@ from unittest.mock import patch
 
 from PySide6.QtCore import QCoreApplication, QEvent, QObject, QTimer, Signal
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
 
 from app.core.config import Config
+from app.core.sync import SyncReport
 from app.core.tasks import new_task
 from app.ui.main_window import MainWindow
 from app.ui.pages.settings import SettingsPage, _ConnectionInput, _write_connection
@@ -36,14 +37,31 @@ class ProgressWorker(QObject):
         super().__init__(parent)
         self.task = task
         self.preview_only = kwargs.get("preview_only", False)
+        self.approved_digest = kwargs.get("approved_digest", "")
         self.operation = kwargs.get("operation") or ("receive" if task.direction == "download" else "publish")
-        self.stopped = False
+        self.outcome = "pending"
+        self.running = False
+        self.stop_calls = 0
+        self.stop_result = True
 
     def start(self):
-        pass
+        self.running = True
+
+    def isRunning(self):
+        return self.running
 
     def stop(self):
-        self.stopped = True
+        self.stop_calls += 1
+        return self.stop_result
+
+    def finish(self):
+        self.running = False
+        self.finished.emit()
+
+    def complete_preview(self, report: SyncReport, reason: str = ""):
+        self.outcome = "preview"
+        self.preview_ready.emit(self.task.id, report, reason)
+        self.finish()
 
 
 class DesktopRegressionTests(unittest.TestCase):
@@ -54,37 +72,39 @@ class DesktopRegressionTests(unittest.TestCase):
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name)
-        self.env = patch.dict(os.environ, {
+        self.enterContext(patch.dict(os.environ, {
             "PHONENAS_DATA_DIR": str(self.base / "app-data"),
             "APPDATA": str(self.base / "profile"),
-        })
-        self.env.start()
+        }))
         self.source = self.base / "source"
         self.source.mkdir()
         self.config = Config(self.base / "config.json")
+        self.config.set("nas.url", "http://fixture.invalid:8888")
         self.task = replace(new_task(str(self.source)), last_sync_at="2026-11-14 09:40:00", last_file_count=5)
         self.config.upsert_task(self.task)
 
-    def tearDown(self):
-        self.env.stop()
-        self.temp.cleanup()
+    def simulated_window(self, *, operational=False, first_run=False, with_tray=False):
+        self.enterContext(patch("app.ui.main_window.SyncWorker", ProgressWorker))
+        self.enterContext(patch("app.ui.main_window.MountSupervisor.start", side_effect=AssertionError("must not mount")))
+        with (patch("app.ui.main_window.QSystemTrayIcon.isSystemTrayAvailable", return_value=with_tray),
+              patch("app.ui.main_window.QSystemTrayIcon.show")):
+            window = MainWindow(self.config, operational=operational or with_tray, first_run=first_run)
+        self.addCleanup(self.dispose_window, window)
+        window.operational = True
+        window.refresh_status()
+        return window
 
     def progress_window(self, *, preview_only=False):
-        worker_patch = patch("app.ui.main_window.SyncWorker", ProgressWorker)
-        worker_patch.start()
-        self.addCleanup(worker_patch.stop)
-        window = MainWindow(self.config, operational=False)
-        self.addCleanup(self.dispose_window, window)
-        # Safe construction schedules no mount or automatic startup. Only this
-        # signal-only worker may run through the normal public task entry point.
-        window.operational = True
+        window = self.simulated_window()
         if preview_only:
             window.preview_task(self.task.id)
         else:
-            window.run_sync(self.task.id)
+            window.scheduler.request(self.task.id, manual=False)
             self.app.processEvents()
         self.assertIsInstance(window.sync_worker, ProgressWorker)
+        self.assertEqual(window.sync_worker.preview_only, preview_only)
         return window, window.sync_worker
 
     def dispose_window(self, window):
@@ -179,16 +199,23 @@ class DesktopRegressionTests(unittest.TestCase):
             self.assertIn(card.message_label.fullText(), window.status_page.state_label.text())
 
     def test_cancelling_replaces_phase_feedback_immediately_and_ignores_late_updates(self):
-        from PySide6.QtWidgets import QMessageBox
         from app.core.progress import SyncProgress
 
         window, worker = self.progress_window()
         card = window.mirror_page.cards[self.task.id]
         worker.progress_event.emit(self.task.id, SyncProgress("applying", "正在上传文件…", 75, 100))
-        with patch("app.ui.main_window.QMessageBox.question", return_value=QMessageBox.StandardButton.Yes):
+        stop = worker.stop
+
+        def stop_while_running():
+            self.assertEqual(window.states[self.task.id]["state"], "running")
+            return stop()
+
+        worker.stop_result = None  # Older doubles may not return a value.
+        with (patch("app.ui.main_window.QMessageBox.question", return_value=QMessageBox.StandardButton.Yes),
+              patch.object(worker, "stop", side_effect=stop_while_running)):
             card.cancel_button.click()
 
-        self.assertTrue(worker.stopped)
+        self.assertEqual(worker.stop_calls, 1)
         self.assertEqual(card.badge.text(), "正在取消")
         self.assertFalse(card.cancel_button.isEnabled())
         self.assertEqual(window.statusBar().currentMessage(), card.message_label.fullText())
@@ -203,9 +230,71 @@ class DesktopRegressionTests(unittest.TestCase):
         self.assertIn(cancelled_feedback, window.status_page.state_label.text())
         self.assertEqual(self.config.get_task(self.task.id).last_sync_at, self.task.last_sync_at)
 
+    def test_rejected_worker_stop_preserves_active_feedback(self):
+        from app.core.progress import SyncProgress
+
+        window, worker = self.progress_window()
+        worker.stop_result = False  # Final verification/saving cannot be interrupted.
+        worker.progress_event.emit(self.task.id, SyncProgress("saving", "正在保存已核对的结果…"))
+        card = window.mirror_page.cards[self.task.id]
+        previous = window.states[self.task.id].copy()
+        feedback = window.statusBar().currentMessage()
+        with patch("app.ui.main_window.QMessageBox.question", return_value=QMessageBox.StandardButton.Yes):
+            card.cancel_button.click()
+        self.assertEqual(worker.stop_calls, 1)
+        self.assertEqual(window.states[self.task.id], previous)
+        self.assertEqual(window.statusBar().currentMessage(), feedback)
+        self.assertTrue(window._progress_timer.isActive())
+        self.assertTrue(card.cancel_button.isEnabled())
+
+    def test_cancel_confirmation_cannot_outlive_the_worker_or_its_pending_state(self):
+        from app.core.progress import SyncProgress
+
+        for late_result in ("success_signal", "success_outcome", "thread_stopped", "replacement", "quitting"):
+            with self.subTest(late_result=late_result):
+                self.config.upsert_task(self.task)
+                window, worker = self.progress_window()
+                worker.progress_event.emit(self.task.id, SyncProgress("applying", "正在写入目标…", 2, 3))
+                active_worker = worker
+                expected = {}
+
+                def finish_in_modal(*_args):
+                    nonlocal active_worker
+                    if late_result == "success_signal":
+                        worker.outcome = "success"
+                        worker.finished_ok.emit(self.task.id, SyncReport(added=1), "2026-11-14_120000")
+                    elif late_result == "success_outcome":
+                        worker.outcome = "success"  # The queued result has not reached the GUI yet.
+                    elif late_result == "thread_stopped":
+                        worker.running = False
+                    elif late_result == "replacement":
+                        window.scheduler.request(self.task.id, manual=True)
+                        worker.failed.emit(self.task.id, "先前尝试结束")
+                        worker.finish()
+                        self.app.processEvents()
+                        active_worker = window.sync_worker
+                        self.assertIsNot(active_worker, worker)
+                        self.assertEqual(active_worker.task.id, worker.task.id)
+                    else:
+                        window._quitting = True
+                    expected.update(state=window.states[self.task.id].copy(), feedback=window.statusBar().currentMessage(),
+                                    timer=window._progress_timer.isActive())
+                    return QMessageBox.StandardButton.Yes
+
+                with patch("app.ui.main_window.QMessageBox.question", side_effect=finish_in_modal):
+                    window.cancel_task(self.task.id)
+
+                self.assertIs(window.sync_worker, active_worker)
+                self.assertEqual(worker.stop_calls, 0)
+                self.assertEqual(active_worker.stop_calls, 0)
+                self.assertEqual(window.states[self.task.id], expected["state"])
+                self.assertEqual(window.statusBar().currentMessage(), expected["feedback"])
+                self.assertEqual(window._progress_timer.isActive(), expected["timer"])
+                window._quitting = False
+                window.quit_app()
+
     def test_terminal_worker_results_clear_phase_feedback_and_never_accept_late_progress(self):
         from app.core.progress import SyncProgress
-        from app.core.sync import SyncReport
 
         for outcome in ("preview_ready", "guarded", "failed", "cancelled_result", "finished_ok"):
             with self.subTest(outcome=outcome):
@@ -253,14 +342,14 @@ class DesktopRegressionTests(unittest.TestCase):
             clock.return_value = 75.0
             worker.progress_event.emit(self.task.id, SyncProgress("staging", "第一轮继续准备…", 90, 100))
             self.assertIn("已用时 01:05", window.mirror_page.cards[self.task.id].message_label.fullText())
-            window.run_sync(other.id)
+            window.scheduler.request(other.id, manual=False)
             self.app.processEvents()
             self.assertIs(window.sync_worker, worker)
             worker.failed.emit(self.task.id, "第一轮已停止")
             window.run_sync(self.task.id)
             self.app.processEvents()
             self.assertIs(window.sync_worker, worker, "A terminal result must not release the serial slot early")
-            worker.finished.emit()
+            worker.finish()
             self.app.processEvents()
             second_worker = window.sync_worker
             self.assertIsInstance(second_worker, ProgressWorker)
@@ -272,10 +361,12 @@ class DesktopRegressionTests(unittest.TestCase):
             self.assertNotIn("已用时", second_card.message_label.fullText())
             self.assertNotIn("第一轮", second_card.message_label.fullText())
             second_worker.failed.emit(other.id, "第二个任务已停止")
-            second_worker.finished.emit()
+            second_worker.finish()
             self.app.processEvents()
             fresh_worker = window.sync_worker
             self.assertEqual(fresh_worker.task.id, self.task.id)
+            self.assertTrue(fresh_worker.preview_only)
+            self.assertEqual(fresh_worker.approved_digest, "")
             fresh_card = window.mirror_page.cards[self.task.id]
             self.assertEqual(fresh_card.message_label.fullText(), "正在校验差异…")
             self.assertEqual(window.statusBar().currentMessage(), fresh_card.message_label.fullText())
@@ -314,6 +405,99 @@ class DesktopRegressionTests(unittest.TestCase):
         self.assertTrue(page.shutdown())
         page.deleteLater()
         self.app.processEvents()
+
+    def test_upgrade_pause_survives_delayed_start_and_only_resumes_after_persisted_approval(self):
+        self.config.set("mount.auto_mount", False)
+        self.config.save()
+        tasks = self.config.tasks
+        callbacks = {}
+        with patch.object(QTimer, "singleShot", side_effect=lambda ms, _context, slot: callbacks.__setitem__(ms, slot)):
+            window = self.simulated_window(operational=True)
+        self.assertTrue(window.scheduler.paused)
+        self.assertFalse(window._schedule_notice.isHidden())
+        self.assertIn("文件名校验", window._schedule_notice.text())
+        self.assertIn("继续自动计划", window.mirror_page.pause_button.text())
+        self.assertFalse(window.scheduler._started)
+        callbacks[2500]()
+        self.app.processEvents()
+        self.assertTrue(window.scheduler._started)
+        self.assertTrue(window.scheduler.paused)
+        self.assertEqual(window.scheduler.queue.queued_ids, ())
+        self.assertIsNone(window.sync_worker)
+        self.assertEqual(self.config.get("app.schedule_approval", ""), "")
+
+        def answer(button):
+            def click(box):
+                self.assertIs(box.defaultButton(), box.button(QMessageBox.StandardButton.No))
+                return button.value
+            return patch.object(QMessageBox, "exec", new=click)
+
+        with answer(QMessageBox.StandardButton.No):
+            window.mirror_page.pause_button.click()
+        self.assertTrue(window.scheduler.paused)
+        self.assertEqual(Config(self.config.path).get("app.schedule_approval", ""), "")
+        with (answer(QMessageBox.StandardButton.Yes), patch.object(window, "_message") as warning,
+              patch.object(self.config, "save", side_effect=OSError("test save failure"))):
+            window.mirror_page.pause_button.click()
+            warning.assert_called_once()
+        self.assertTrue(window.scheduler.paused)
+        self.assertEqual(self.config.get("app.schedule_approval", ""), "")
+        with answer(QMessageBox.StandardButton.Yes):
+            window.mirror_page.pause_button.click()
+        self.assertFalse(window.scheduler.paused)
+        self.assertTrue(window._schedule_notice.isHidden())
+        reloaded = Config(self.config.path)
+        self.assertEqual(reloaded.get("app.schedule_approval", ""), "1.2.4-filenames")
+        self.assertEqual(reloaded.tasks, tasks)
+        self.app.processEvents()
+        self.assertFalse(window.sync_worker.preview_only)
+        self.assertEqual(window.sync_worker.approved_digest, "")
+        window.toggle_pause()
+        self.assertTrue(window.scheduler.paused)
+        self.assertEqual(Config(self.config.path).get("app.schedule_approval", ""), "1.2.4-filenames")
+        with patch.object(QTimer, "singleShot"):
+            self.config = reloaded
+            restarted = self.simulated_window(operational=True)
+        self.assertFalse(restarted.scheduler.paused)
+        self.assertTrue(restarted._schedule_notice.isHidden())
+
+    def test_import_reapplies_pause_before_updating_due_tasks(self):
+        self.config.set("mount.auto_mount", False)
+        self.config.set("app.schedule_approval", "1.2.4-filenames")
+        self.config.save()
+        with patch.object(QTimer, "singleShot"):
+            window = self.simulated_window(operational=True)
+        window._start_scheduler()
+        self.assertFalse(window.scheduler.paused)
+        exported = self.base / "exported.json"
+        self.config.export_to(exported)
+        self.config.import_from(exported)
+        window.settings_page.saved.emit()
+        self.app.processEvents()
+        self.assertTrue(window.scheduler.paused)
+        self.assertIsNone(window.sync_worker)
+        self.assertFalse(window._schedule_notice.isHidden())
+        self.assertEqual(self.config.get("app.schedule_approval", ""), "")
+        self.assertEqual((self.config.tasks[0].auto_sync, self.config.tasks[0].interval_minutes),
+                         (self.task.auto_sync, self.task.interval_minutes))
+
+    def test_delayed_existing_profile_callbacks_do_not_restart_after_quit_begins(self):
+        callbacks = {}
+        with patch.object(QTimer, "singleShot", side_effect=lambda ms, _context, slot: callbacks.__setitem__(ms, slot)):
+            window = self.simulated_window(operational=True)
+        window.preview_task(self.task.id)
+        worker = window.sync_worker
+        window.mount._retry_timer.start(5000)  # Simulate a pending retry without mounting.
+        window.quit_app()
+        self.assertIs(window.sync_worker, worker)
+        self.assertFalse(window.mount._retry_timer.isActive())
+        callbacks[400]()
+        callbacks[2500]()
+        self.app.processEvents()
+        self.assertFalse(window.scheduler._started)
+        self.assertTrue(window.scheduler.paused)
+        self.assertIs(window.sync_worker, worker)
+        worker.finish()
 
     def test_saving_first_task_after_skipped_setup_starts_the_schedule(self):
         config = Config(self.base / "first.json")
@@ -373,39 +557,119 @@ class DesktopRegressionTests(unittest.TestCase):
             QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
             self.app.processEvents()
 
+    def test_overview_and_tray_sync_all_require_each_task_to_confirm_a_fresh_digest(self):
+        download = replace(new_task(str(self.base / "receive"), direction="download"), auto_sync=False)
+        disabled = replace(new_task(str(self.base / "disabled")), enabled=False)
+        self.config.replace_tasks((self.task, download, disabled))
+        for entry in ("overview", "tray"):
+            with self.subTest(entry=entry):
+                window = self.simulated_window(with_tray=entry == "tray")
+                window.scheduler.pause()
+                if entry == "overview":
+                    window.status_page.sync_button.click()
+                else:
+                    self.assertTrue(window.isHidden())
+                    window.tray.contextMenu().actions()[1].trigger()
+                    self.assertTrue(window.isVisible())
+                self.app.processEvents()
+                first = window.sync_worker
+                self.assertEqual((first.task.id, first.operation, first.preview_only, first.approved_digest),
+                                 (self.task.id, "publish", True, ""))
+                self.assertEqual(window.scheduler.queue.queued_ids, (download.id,))
+                preview_report = SyncReport(operation="publish", digest="first-preview")
+                with patch("app.ui.main_window.PreviewDialog") as preview:
+                    def reject_first():
+                        self.app.processEvents()  # Simulate the nested modal loop.
+                        self.assertIsNone(window.sync_worker)
+                        self.assertEqual(window.scheduler.queue.active_id, self.task.id)
+                        return QDialog.DialogCode.Rejected
+                    preview.return_value.exec.side_effect = reject_first
+                    first.complete_preview(preview_report)
+                    self.assertIsNone(window.sync_worker)
+                self.app.processEvents()
+                second = window.sync_worker
+                self.assertEqual((second.task.id, second.operation, second.preview_only, second.approved_digest),
+                                 (download.id, "receive", True, ""))
+                with patch("app.ui.main_window.PreviewDialog") as preview:
+                    preview.return_value.exec.return_value = QDialog.DialogCode.Accepted
+                    second.complete_preview(SyncReport(operation="receive", digest="second-preview"))
+                apply = window.sync_worker
+                self.assertEqual((apply.task.id, apply.operation, apply.preview_only, apply.approved_digest),
+                                 (download.id, "receive", False, "second-preview"))
+                self.assertEqual(window.scheduler.queue.active_id, download.id)
+                apply.finish()
+                self.app.processEvents()
+                self.assertIsNone(window.sync_worker)
+                self.assertEqual(window.scheduler.queue.queued_ids, ())
+                self.assertTrue(window.scheduler.paused)
+
+    def test_skipping_overdue_auto_task_in_sync_all_does_not_immediately_write_it(self):
+        self.config.set("app.schedule_approval", "1.2.4-filenames")
+        self.config.set("mount.auto_mount", False)
+        with patch.object(QTimer, "singleShot"):
+            window = self.simulated_window(operational=True)
+        window._start_scheduler()
+        self.assertFalse(window.scheduler.paused)
+        self.assertEqual(window.scheduler.queue.queued_ids, (self.task.id,))
+        window.status_page.sync_button.click()
+        self.app.processEvents()
+        worker = window.sync_worker
+        self.assertTrue(worker.preview_only)
+        with patch("app.ui.main_window.PreviewDialog") as preview:
+            preview.return_value.exec.return_value = QDialog.DialogCode.Rejected
+            worker.complete_preview(SyncReport(digest="skipped"))
+        window.scheduler._on_timeout()
+        self.app.processEvents()
+        self.assertIsNone(window.sync_worker)
+        self.assertEqual(window.scheduler.queue.queued_ids, ())
+        self.assertFalse(window.scheduler.paused)
+        self.assertEqual(self.config.get_task(self.task.id), self.task)
+
+    def test_manual_confirmation_cannot_use_empty_blocked_or_outdated_preview(self):
+        window = self.simulated_window()
+        window.scheduler.pause()
+        for case in ("empty", "blocked", "wrong_operation", "changed_task", "quitting"):
+            with self.subTest(case=case):
+                window.run_sync(self.task.id)
+                self.app.processEvents()
+                worker = window.sync_worker
+                self.assertTrue(worker.preview_only)
+
+                def accept():
+                    if case == "changed_task":
+                        self.config.upsert_task(replace(self.task, name="Updated"))
+                    if case == "quitting":
+                        window.quit_app()
+                    return QDialog.DialogCode.Accepted
+
+                with patch("app.ui.main_window.PreviewDialog") as preview:
+                    preview.return_value.exec.side_effect = accept
+                    worker.complete_preview(SyncReport(
+                        operation="receive" if case == "wrong_operation" else "publish",
+                        digest="" if case == "empty" else "approved",
+                        blocked=case == "blocked",
+                    ))
+                self.assertIsNone(window.sync_worker)
+                self.assertIsNone(window.scheduler.queue.active_id)
+                self.config.upsert_task(self.task)
+
     def test_confirmed_relay_claims_serial_slot_and_keeps_cancel_visible(self):
-        from app.core.sync import SyncReport
-        class FakeWorker:
-            def __init__(self, config, task, parent=None, **kwargs):
-                self.task = task
-                self.preview_only = kwargs.get("preview_only", False)
-                self.operation = kwargs.get("operation") or "publish"
-                self.progress = self.progress_event = self.finished_ok = self.failed = self.cancelled_result = self.guarded = self.preview_ready = self.finished = type("FakeSignal", (), {"connect": lambda *args: None})()
-            def start(self):
-                pass
-            def stop(self):
-                pass
-            def deleteLater(self):
-                pass
-        with patch("app.ui.main_window.SyncWorker", FakeWorker), patch("app.ui.main_window.PreviewDialog") as preview:
-            window = MainWindow(self.config, operational=False)
-            report = SyncReport(operation="adopt", digest="approved")
-            window.operational = True
-            window.sync_worker = FakeWorker(self.config, self.task, preview_only=True, operation="adopt")
-            window._preview_results[self.task.id] = (report, "核对后接收")
-            preview.return_value.exec.return_value = 1
-            window._on_worker_finished()
-            self.assertEqual(window.scheduler.queue.active_id, self.task.id)
-            window.scheduler.queue.due()
-            window.refresh_status()
-            card = window.mirror_page.cards[self.task.id]
-            self.assertFalse(card.cancel_button.isHidden())
-            self.assertNotEqual(card.badge.text(), "等待执行")
-            window.sync_worker = None
-            window.scheduler.complete(self.task.id)
-            window.quit_app()
-            window.deleteLater()
-            self.app.processEvents()
+        window = self.simulated_window()
+        window.relay_task(self.task.id, "adopt")
+        worker = window.sync_worker
+        self.assertTrue(worker.preview_only)
+        self.assertIsNone(window.scheduler.queue.active_id)
+        with patch("app.ui.main_window.PreviewDialog") as preview:
+            preview.return_value.exec.return_value = QDialog.DialogCode.Accepted
+            worker.complete_preview(SyncReport(operation="adopt", digest="approved"), "核对后接收")
+        self.assertEqual(window.scheduler.queue.active_id, self.task.id)
+        self.assertEqual(window.sync_worker.operation, "adopt")
+        self.assertEqual(window.sync_worker.approved_digest, "approved")
+        window.scheduler.queue.due()
+        window.refresh_status()
+        card = window.mirror_page.cards[self.task.id]
+        self.assertFalse(card.cancel_button.isHidden())
+        self.assertNotEqual(card.badge.text(), "等待执行")
 
     def test_explicit_upload_and_download_buttons_preview_actual_direction(self):
         for direction, expected in (("upload", ("publish", "adopt")), ("download", ("return", "receive"))):

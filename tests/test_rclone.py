@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import threading
 import unittest
@@ -37,6 +38,34 @@ class RcloneIsolationTests(unittest.TestCase):
                 self.assertFalse(client.run(["version"]).ok)
                 with self.assertRaises(RuntimeError):
                     client.popen(["version"])
+
+    def test_file_operations_use_literal_names_and_keep_filter_syntax(self):
+        with tempfile.TemporaryDirectory() as root:
+            base = Path(root)
+            client = Rclone(Config(base / "config.json"), conf_path=base / "shared.conf")
+            executable = base / "rclone.exe"
+            executable.touch()
+            private = base / "private.conf"
+            rule = "/part[\u2421].txt"
+            command = ["lsjson", "phone:PCB\u200b", "--exclude", rule]
+            with patch("app.core.rclone.rclone_exe", return_value=executable), \
+                    patch.dict(os.environ, {"RCLONE_EXCLUDE": "irrelevant", "RCLONE_WEBdav_URL": "invalid"}), \
+                    patch("app.core.rclone.subprocess.Popen") as spawn:
+                proc = spawn.return_value
+                proc.communicate.return_value = ("[]", "")
+                proc.returncode = 0
+                proc.poll.return_value = 0
+                self.assertTrue(client.run(command, conf_path=private).ok)
+                args, options = spawn.call_args
+                self.assertEqual(args[0][1:1 + len(command)], command)
+                self.assertEqual(args[0][-2:], ["--config", str(private)])
+                self.assertNotIn("RCLONE_EXCLUDE", options["env"])
+                self.assertFalse(any(key.upper() == "RCLONE_WEBDAV_URL" for key in options["env"]))
+                client.popen(["mount", "phone:", "W:", "--read-only"], conf_path=private)
+                mount = spawn.call_args.args[0]
+                self.assertNotIn("--local-encoding", mount)
+                self.assertNotIn("--webdav-encoding", mount)
+                self.assertEqual(mount[-2:], ["--config", str(private)])
 
     def test_configuration_line_injection_is_rejected_before_obscuring(self):
         with tempfile.TemporaryDirectory() as root:

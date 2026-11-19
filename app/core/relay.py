@@ -18,6 +18,7 @@ from types import MappingProxyType
 from typing import Mapping
 
 from app import constants as C
+from app.core.filenames import LEGACY, LITERAL, portable_name_key, require_legacy_paths, require_legacy_rules
 from app.core.history import validate_history_inventory
 from app.core.tasks import MirrorTask
 
@@ -265,12 +266,35 @@ def _uuid(value: str) -> str:
     return uuid.UUID(value).hex
 
 
+def read_file_namespace(rclone, path: str, *, allow_missing=False, cancelled=None):
+    """Read actual, unfiltered file and directory names without hashing content."""
+    _check_cancel(cancelled)
+    if not re.match(r"^[^/\\:]+:", path) or re.match(r"^[a-zA-Z]:[/\\]", path):
+        _inspect_local_tree(Path(os.path.abspath(path)), cancelled)
+    options = {"cancel_event": cancelled} if cancelled is not None else {}
+    result = rclone.run(["lsjson", path, "--recursive", "--no-modtime", "--no-mimetype"],
+                        timeout=120, **options)
+    _check_cancel(cancelled)
+    if not result.ok:
+        if allow_missing and result.code == 3:
+            return None
+        raise RuntimeError(f"无法核对完整文件名清单：{result.err or result.out or result.code}")
+    files, directories, _ = _inventory(result.out, cancelled)
+    return files, directories
+
+
+def require_legacy_scope(task: MirrorTask) -> None:
+    require_legacy_paths((task.local_path, task.local_history_path, task.remote_path, task.versions_path),
+                         location="任务或历史根目录")
+    require_legacy_rules(task.excludes)
+
+
 def _task_scope(task: MirrorTask) -> dict:
     if not isinstance(task, MirrorTask) or not re.fullmatch(r"[0-9a-f]{32}", task.dataset_id):
         raise ValueError("数据集必须关联有效任务")
     validate_history_inventory((), (task.remote_path, task.versions_path))
     _exclude_args(task.excludes)
-    roots = [tuple(path.casefold().split("/")) for path in (task.remote_path, task.versions_path)]
+    roots = [tuple(map(portable_name_key, path.split("/"))) for path in (task.remote_path, task.versions_path)]
     if any(root[0] == ".phonenas" for root in roots):
         raise ValueError("数据与历史目录不能包含控制目录")
     if roots[0][:min(map(len, roots))] == roots[1][:min(map(len, roots))]:
@@ -324,7 +348,7 @@ class BaselineStore:
                         "local_path": task.local_path, "local_history_path": task.local_history_path,
                         "sync_identity": _uuid(task.sync_identity)}
 
-    def load(self) -> tuple[ContentSnapshot, str] | None:
+    def load(self, *, protocol: int | None = None) -> tuple[ContentSnapshot, str] | None:
         _no_links(self.path)
         try:
             payload = _json(_read_file(self.path))
@@ -335,7 +359,7 @@ class BaselineStore:
         try:
             if (type(payload) is not dict or set(payload) != {
                     "version", "binding", "snapshot", "generation", "content_digest"}
-                    or type(payload["version"]) is not int or payload["version"] != 1
+                    or type(payload["version"]) is not int or payload["version"] not in (LEGACY, LITERAL)
                     or type(payload["binding"]) is not dict
                     or set(payload["binding"]) != set(self.binding)):
                 raise ValueError("无效的基线格式")
@@ -357,13 +381,17 @@ class BaselineStore:
             raise RuntimeError("本地基线已损坏") from exc
         if binding != self.binding:
             return None
+        if protocol is not None and payload["version"] != protocol:
+            raise RuntimeError("本地基线与手机数据集的文件名协议不同；请保留两端文件和原有状态，不会自动转换。")
         return snapshot, payload["generation"]
 
-    def save(self, snapshot: ContentSnapshot, generation: str) -> None:
+    def save(self, snapshot: ContentSnapshot, generation: str, *, protocol: int = LEGACY) -> None:
         if not isinstance(snapshot, ContentSnapshot):
             raise ValueError("基线必须是内容快照")
+        if type(protocol) is not int or protocol not in (LEGACY, LITERAL):
+            raise ValueError("无效的文件名协议")
         _uuid(generation)
-        _atomic_json(self.path, {"version": 1, "binding": self.binding,
+        _atomic_json(self.path, {"version": protocol, "binding": self.binding,
                                 "snapshot": snapshot.to_dict(), "generation": generation,
                                 "content_digest": snapshot.digest})
 
@@ -387,7 +415,7 @@ class DatasetCoordinator:
         required = {"version", *self.scope, "generation", "phase"}
         if (type(value) is not dict or not required.issubset(value)
                 or set(value) - required - {"content_digest", "writer_identity"}
-                or type(value["version"]) is not int or value["version"] != 1
+                or type(value["version"]) is not int or value["version"] not in (LEGACY, LITERAL)
                 or any(type(value[key]) is not type(expected) or value[key] != expected
                        for key, expected in self.scope.items())
                 or type(value["phase"]) is not str or value["phase"] not in _PHASES):
@@ -412,8 +440,8 @@ class DatasetCoordinator:
         except (ValueError, TypeError, KeyError) as exc:
             raise RuntimeError("数据集状态损坏或与任务不匹配") from exc
 
-    def write(self, phase: str, generation: str, content_digest: str = "") -> None:
-        state = self._state({"version": 1, **self.scope, "phase": phase,
+    def write(self, phase: str, generation: str, content_digest: str = "", *, protocol: int = LEGACY) -> None:
+        state = self._state({"version": protocol, **self.scope, "phase": phase,
                              "generation": generation, "content_digest": content_digest,
                              "writer_identity": self.task.sync_identity})
         with tempfile.TemporaryDirectory(prefix="PhoneNAS-dataset-") as root:

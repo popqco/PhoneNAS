@@ -7,7 +7,6 @@ from datetime import datetime
 from pathlib import Path
 from dataclasses import replace
 
-from app import constants as C
 from app.core.config import Config
 from app.core.retention import old_versions, parse_version_name
 from app.core.sync import build_sync_args
@@ -19,7 +18,7 @@ class ConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
             config = Config(path)
-            self.assertEqual(config.url, C.DEFAULT_URL)
+            self.assertEqual(config.url, "")
             task = new_task(r"D:\TestFolder")
             config.upsert_task(task)
             config.password = "secret"

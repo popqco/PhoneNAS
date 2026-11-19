@@ -89,8 +89,8 @@ class TaskUiTests(unittest.TestCase):
             def run(self, args, **kwargs):
                 requests.append((args, self.config.url, self.conf_path.is_file()))
                 return Result(True, json.dumps([
-                    {"Path": "backup", "IsDir": True},
-                    {"Path": "work", "IsDir": True},
+                    {"Path": "backup\u200b", "IsDir": True},
+                    {"Path": "work\x7f", "IsDir": True},
                     {"Path": "../escape", "IsDir": True},
                     {"Path": "/absolute", "IsDir": True},
                     {"Path": "other:remote", "IsDir": True},
@@ -116,11 +116,12 @@ class TaskUiTests(unittest.TestCase):
             self.assertTrue(requests[0][2])
             self.assertIsNot(clients[0].config, self.config)
             self.assertFalse(clients[0].conf_path.exists())
-            self.assertEqual([dialog.tree.topLevelItem(i).text(0) for i in range(2)], ["backup", "work"])
-            dialog.tree.setCurrentItem(dialog.tree.topLevelItem(0))
+            self.assertEqual([dialog.tree.topLevelItem(i).text(0) for i in range(2)],
+                             ["backup<U+200B>", "work<U+007F>"])
+            dialog.tree.setCurrentItem(dialog.tree.topLevelItem(1))
             dialog.choose_button.click()
             self.assertEqual(dialog.result(), QDialog.DialogCode.Accepted)
-            self.assertEqual(dialog.remote_path, "backup")
+            self.assertEqual(dialog.remote_path, "work\x7f")
         self.assertEqual(self.config.data, before)
         self.assertFalse(self.config.path.exists())
 
@@ -137,7 +138,7 @@ class TaskUiTests(unittest.TestCase):
                 {"Path": "backup/nested", "IsDir": True},
                 {"Path": "bad\\\\path", "IsDir": True},
                 {"Path": " whitespace", "IsDir": True},
-                {"Path": "bad\u007fname", "IsDir": True},
+                {"Path": "bad\u202ename", "IsDir": True},
             ],
             "phone:backup": [{"Path": "mirror", "IsDir": True}],
         }
@@ -207,6 +208,19 @@ class TaskUiTests(unittest.TestCase):
         self.assertEqual(dialog.interval_spin.maximum(), 1440)
         self.assertEqual(self.config.data, before)
         self.assertFalse(self.config.path.exists())
+
+    def test_task_save_keeps_literal_custom_rule_whitespace_and_unicode(self):
+        from app.ui.task_dialog import TaskDialog
+        from app.core.tasks import new_task
+
+        rules = (" notes.txt", "literal\u2029separator.txt", "/pair[\u2421].txt")
+        task = replace(new_task(str(self.source)), exclude_preset="custom", excludes=rules)
+        dialog = self.keep(TaskDialog(self.config, task))
+        dialog.name_edit.setText("Renamed only")
+        dialog.accept()
+        self.assertEqual(dialog.result(), QDialog.DialogCode.Accepted)
+        self.assertEqual(dialog.task.excludes, rules)
+        self.assertEqual(dialog.task.sync_identity, task.sync_identity)
 
     def test_schedule_auto_sync_is_independent_of_enabled_and_preserves_binding_authority(self):
         from app.core.tasks import new_task

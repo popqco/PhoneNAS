@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 
 from app import constants as C
 from app.core.config import Config
+from app.core.filenames import display_path, portable_name_key
 from app.core.rclone import Rclone
 from app.core.tasks import normalize_remote_path
 from app.ui.pages.settings import _operational
@@ -88,9 +89,12 @@ class _DirectoryListing(QThread):
                         normalized = normalize_remote_path(name)
                     except ValueError:
                         continue
-                    if name != normalized or any(ord(char) == 127 for char in name):
+                    if name != normalized:
                         continue
-                    names.setdefault(name.casefold(), name)
+                    key = portable_name_key(name)
+                    if key in names and names[key] != name:
+                        raise ValueError("手机目录有大小写或 Unicode 名称冲突，无法安全选择。")
+                    names[key] = name
                 self.paths = tuple(
                     f"{self.remote_path}/{name}" if self.remote_path else name
                     for name in sorted(names.values(), key=str.casefold)
@@ -271,11 +275,11 @@ class RemoteFolderDialog(QDialog):
         else:
             self._current_path = worker.remote_path
             self._loaded = True
-            self.path_label.setText(f"{C.DEFAULT_REMOTE}:/{self._current_path}")
+            self.path_label.setText(f"{C.DEFAULT_REMOTE}:/{display_path(self._current_path)}")
             for path in worker.paths:
-                item = QTreeWidgetItem([path.rsplit("/", 1)[-1]])
+                item = QTreeWidgetItem([display_path(path.rsplit("/", 1)[-1])])
                 item.setData(0, Qt.ItemDataRole.UserRole, path)
-                item.setToolTip(0, path)
+                item.setToolTip(0, display_path(path))
                 self.tree.addTopLevelItem(item)
             self.status_label.setText(f"{len(worker.paths)} 个子目录。选中镜像目录后确认；双击可进入。" if worker.paths else "当前目录没有子目录。可选择当前目录或返回上一级。")
             self.refresh_button.setText("刷新当前目录")

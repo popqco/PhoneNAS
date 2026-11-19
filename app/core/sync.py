@@ -13,6 +13,7 @@ from PySide6.QtCore import QThread, Signal
 
 from app import constants as C
 from app.core.config import Config, data_dir
+from app.core.filenames import LEGACY, LITERAL, require_legacy_paths
 from app.core.log import get_logger
 from app.core.progress import SyncProgress
 from app.core.rclone import Rclone
@@ -145,7 +146,7 @@ class SyncEngine:
         self, rclone: Rclone, task: MirrorTask, *, mount_drive: str = "X:",
         log_directory: Path | None = None, progress=None, cancelled: threading.Event | None = None,
         state_directory: Path | None = None, operation: str = "", lease_factory=None,
-        progress_event=None,
+        progress_event=None, begin_commit=None,
     ):
         self.rclone = rclone
         self.task = task
@@ -155,6 +156,7 @@ class SyncEngine:
         self.progress_event = progress_event or (lambda _event: None)
         self._current_progress = SyncProgress("preparing", "正在准备任务…")
         self.cancelled = cancelled or threading.Event()
+        self.begin_commit = begin_commit or self._check_cancel
         self.state_directory = state_directory
         self.recovering = operation == "recover"
         self.operation = operation or ("receive" if task.direction == "download" else "publish")
@@ -188,10 +190,13 @@ class SyncEngine:
     def receiving(self) -> bool:
         return self.operation in ("receive", "adopt")
 
-    def _validate(self) -> None:
-        from app.core.history import _no_links
+    def _check_cancel(self) -> None:
         if self.cancelled.is_set():
             raise RuntimeError("操作已取消")
+
+    def _validate(self) -> None:
+        from app.core.history import _no_links
+        self._check_cancel()
         validate_tasks((self.task,), self.mount_drive)
         validate_source(self.task, self.mount_drive)
         _no_links(Path(self.task.local_path))
@@ -205,15 +210,106 @@ class SyncEngine:
             DatasetCoordinator(self.rclone, self.task, lease_factory=self.lease_factory),
         )
 
+    def _namespace(self, path: str, *, allow_missing: bool = False):
+        from app.core.relay import read_file_namespace
+
+        try:
+            return read_file_namespace(self.rclone, path, allow_missing=allow_missing, cancelled=self.cancelled)
+        except ValueError as exc:
+            location = "手机目录" if path.startswith(f"{C.DEFAULT_REMOTE}:") else "本地目录"
+            raise ValueError(f"{location}检查未通过：{exc}") from exc
+
+    def _verify_namespace(self, protocol: int, *, allow_missing: bool, recorded=()) -> str:
+        from app.core.history import validate_history_inventory
+        from app.core.relay import require_legacy_scope
+
+        if protocol == LEGACY:
+            require_legacy_scope(self.task)
+            for snapshot in recorded:
+                require_legacy_paths(snapshot.directories, location="旧记录中的目录")
+                require_legacy_paths(snapshot.files, location="旧记录中的文件")
+        # Filters select managed files, not what Win32 (or a case-insensitive
+        # DAV target) might address when applying that plan. Check both full
+        # namespaces before permitting a write to a filtered tree.
+        if protocol != LEGACY and not self.task.excludes:
+            return ""
+        local = self._namespace(self.task.local_path)
+        remote = self._namespace(f"{C.DEFAULT_REMOTE}:{self.task.remote_path}", allow_missing=allow_missing)
+        if protocol == LEGACY:
+            for files, directories in (items for items in (local, remote) if items is not None):
+                require_legacy_paths(directories, location="未过滤目录")
+                require_legacy_paths(files, location="未过滤文件")
+        if local is not None and remote is not None:
+            try:
+                validate_history_inventory(local[0].keys() | remote[0].keys(), set(local[1]) | set(remote[1]))
+            except ValueError as exc:
+                return str(exc)
+        return ""
+
+    def _new_protocol(self, store) -> int:
+        # An unmarked existing mirror/history, or an orphaned local baseline,
+        # is never presumed fresh based on a filtered snapshot.
+        if store.path.exists():
+            return LEGACY
+        remote_root = f"{C.DEFAULT_REMOTE}:{self.task.remote_path}"
+        mirror = self._namespace(remote_root, allow_missing=True)
+        if mirror is not None and any(mirror):
+            return LEGACY
+        # A history directory's existence is evidence of use even if it is now
+        # empty. Never bless old batches with a new dataset-wide v2 marker.
+        for history in (f"{C.DEFAULT_REMOTE}:{self.task.versions_path}", self.task.local_history_path):
+            if self._namespace(history, allow_missing=True) is not None:
+                return LEGACY
+        return LITERAL
+
+    def _verify_protocol(self, store, metadata, pending):
+        protocol = metadata["version"] if metadata else pending["version"] if pending else self._new_protocol(store)
+        if pending is not None and pending["version"] != protocol:
+            raise RuntimeError("旧未完成操作与当前手机的文件名协议不同；保留原记录和锁，不能续作。")
+        baseline = store.load(protocol=protocol)
+        recorded = (baseline[0],) if baseline else ()
+        if pending is not None:
+            recorded += (pending["local"], pending["remote"])
+        allow_missing = not self.receiving and self.operation == "publish"
+        conflict = self._verify_namespace(protocol, allow_missing=allow_missing, recorded=recorded)
+        return protocol, baseline, conflict
+
+    def _verify_recovery_history(self, pending, protocol: int):
+        from app.core.history import validate_history_inventory
+        from app.core.relay import ContentSnapshot
+
+        history_root = self._history_root(pending["stamp"])
+        backup = self._snapshot("check_history", "正在核对续作要使用的原历史批次…", history_root, allow_missing=True)
+        backup = backup or ContentSnapshot({})
+        if protocol == LEGACY:
+            require_legacy_paths(backup.directories, location="旧历史批次目录")
+            require_legacy_paths(backup.files, location="旧历史批次文件")
+        original = pending["local"] if self.receiving else pending["remote"]
+        try:
+            validate_history_inventory(backup.files.keys() | original.files.keys(),
+                                       set(backup.directories) | set(original.directories))
+        except ValueError as exc:
+            return backup, str(exc)
+        # Never overwrite an unrelated or modified copy in the reused batch,
+        # even if the corresponding old file is still present at the target.
+        if any(item != original.files.get(path) for path, item in backup.files.items()):
+            return backup, "原历史批次含有未能证明为旧目标内容的文件，不能安全复用该批次。"
+        return backup, ""
+
+    def _history_root(self, stamp: str) -> str:
+        if self.receiving:
+            return str(Path(self.task.local_history_path) / stamp)
+        return f"{C.DEFAULT_REMOTE}:{self.task.versions_path}/{stamp}"
+
     @staticmethod
-    def _baseline_initialization_preview(store, local, remote, metadata, baseline):
+    def _baseline_initialization_preview(store, local, remote, metadata, baseline, protocol):
         binding_digest = _canonical_digest(store.binding)
         generation = metadata["generation"] if metadata else ""
         return BaselineInitializationPreview(
             digest=_canonical_digest({
                 "operation": "initialize_baseline", "binding_digest": binding_digest,
                 "baseline_path": str(store.path), "local_digest": local.digest,
-                "remote_digest": remote.digest, "metadata": metadata,
+                "remote_digest": remote.digest, "metadata": metadata, "filename_protocol": protocol,
                 "baseline": [baseline[0].digest, baseline[1]] if baseline else None,
             }),
             file_count=len(local.files), local_digest=local.digest,
@@ -228,14 +324,19 @@ class SyncEngine:
         store, coordinator = self._context()
         if PendingOperation(store).load() is not None:
             raise RuntimeError("本机有未完成的操作，不能初始化共同基线。")
-        baseline = store.load()
-        if baseline is None and store.path.exists():
-            raise RuntimeError("现有共同基线属于其他连接或范围；请先保留并人工核对，不能覆盖初始化。")
         if check_lock and coordinator.locked():
             raise RuntimeError("数据集锁已占用；不会初始化共同基线或接管旧锁。")
         metadata = coordinator.read()
         if metadata is not None and metadata["phase"] != "ready":
             raise RuntimeError("手机数据集有未完成的发布，不能初始化共同基线。")
+        # Adoption operates on existing trees, so an unmarked tree stays v1.
+        protocol = metadata["version"] if metadata else LEGACY
+        baseline = store.load(protocol=protocol)
+        if baseline is None and store.path.exists():
+            raise RuntimeError("现有共同基线属于其他连接或范围；请先保留并人工核对，不能覆盖初始化。")
+        conflict = self._verify_namespace(protocol, allow_missing=False, recorded=(baseline[0],) if baseline else ())
+        if conflict:
+            raise RuntimeError(f"两端名称不一致，不能初始化共同基线：{conflict}")
         local = self._snapshot("inspect_local", "正在校验首次基线的本地文件内容…",
                                self.task.local_path, self.task.excludes)
         remote = self._snapshot("inspect_remote", "正在校验首次基线的手机内容；无服务器哈希时需读取文件…",
@@ -247,8 +348,8 @@ class SyncEngine:
         if baseline is not None and (metadata is None or baseline[1] != metadata["generation"]
                                      or baseline[0].digest != remote.digest):
             raise RuntimeError("现有共同基线与当前手机内容或批次冲突，不能重新初始化。")
-        preview = self._baseline_initialization_preview(store, local, remote, metadata, baseline)
-        return preview, store, coordinator, local, remote, metadata, baseline
+        preview = self._baseline_initialization_preview(store, local, remote, metadata, baseline, protocol)
+        return preview, store, coordinator, local, remote, metadata, baseline, protocol
 
     def preview_baseline_initialization(self) -> BaselineInitializationPreview:
         """Read-only approval for adopting two existing, identical file trees."""
@@ -260,35 +361,35 @@ class SyncEngine:
         """Initialize control state and a local baseline, never transfer payloads."""
         if type(approved) is not BaselineInitializationPreview:
             raise ValueError("必须明确确认首次基线预览")
-        fresh, store, coordinator, local, remote, metadata, baseline = self._baseline_initialization_state()
+        fresh, store, coordinator, _, _, _, _, _ = self._baseline_initialization_state()
         if fresh != approved:
             raise RuntimeError("首次基线的内容、连接或范围已变化，请重新预览后确认。")
         with coordinator.lease() as lease:
-            fresh, store, coordinator, local, remote, metadata, baseline = self._baseline_initialization_state(check_lock=False)
+            fresh, store, coordinator, _, remote, metadata, baseline, protocol = self._baseline_initialization_state(check_lock=False)
             if fresh != approved:
                 raise RuntimeError("首次基线的内容、连接或范围已变化，请重新预览后确认。")
             created_metadata = metadata is None
             generation = metadata["generation"] if metadata else uuid.uuid4().hex
             expected = metadata if metadata is not None else {
-                "version": 1, **coordinator.scope, "phase": "ready",
+                "version": protocol, **coordinator.scope, "phase": "ready",
                 "generation": generation, "content_digest": remote.digest,
                 "writer_identity": self.task.sync_identity,
             }
             try:
                 if created_metadata:
-                    coordinator.write("ready", generation, content_digest=remote.digest)
+                    coordinator.write("ready", generation, content_digest=remote.digest, protocol=protocol)
                 if coordinator.read() != expected:
                     raise RuntimeError("首次基线的数据集状态回读核对失败；没有保存本地基线。")
                 # Read both full trees again after the ready response: metadata
                 # success alone cannot establish a trustworthy content baseline.
-                verified, final_store, _, final_local, final_remote, final_metadata, final_baseline = (
+                verified, final_store, _, _, final_remote, final_metadata, final_baseline, final_protocol = (
                     self._baseline_initialization_state(check_lock=False)
                 )
                 if (verified.binding_digest != approved.binding_digest
                         or final_store.path != store.path
                         or verified.local_digest != approved.local_digest
                         or verified.remote_digest != approved.remote_digest
-                        or final_metadata != expected or final_baseline != baseline):
+                        or final_metadata != expected or final_baseline != baseline or final_protocol != protocol):
                     raise RuntimeError("首次基线的内容或状态已变化；没有保存本地基线。")
                 if self.cancelled.is_set():
                     raise RuntimeError("操作已取消")
@@ -302,10 +403,10 @@ class SyncEngine:
         # A later publication has a different generation/content and normal sync
         # will reject this last-verified baseline rather than overwrite it.
         if baseline is None:
-            store.save(final_remote, generation)
+            store.save(final_remote, generation, protocol=protocol)
         return BaselineInitializationResult(generation, len(final_remote.files), created_metadata)
 
-    def _inspect(self, *, check_lock: bool = True):
+    def _inspect(self, *, check_lock: bool = True, recovery_token: str | None = None):
         from app.core.relay import ContentSnapshot
         self._stage("inspect_control", "正在核对任务路径、保护锁与发布状态…")
         self._validate()
@@ -318,22 +419,29 @@ class SyncEngine:
             self.operation = pending["operation"]
         elif pending is not None:
             raise RuntimeError("本机有未完成的操作；请在任务更多菜单中选择‘继续未完成操作’，不会自动覆盖部分结果。")
+        if recovery_token is not None and (pending is None or pending["lock_token"] != recovery_token):
+            raise RuntimeError("未完成记录已变化，请重新查看差异后确认。")
         if check_lock and not self.recovering and coordinator.locked():
             raise RuntimeError("此数据集正由另一台电脑操作，或上轮异常退出留下了保护锁；不会自动抢占。")
-        if self.recovering and pending["operation"] in ("publish", "return") and not coordinator.locked():
+        if check_lock and self.recovering and not self.receiving and not coordinator.locked():
             raise RuntimeError("上次发布的所有权锁已缺失，不能证明仍由原操作独占；请先保留两端文件并核对。")
         metadata = coordinator.read()
+        protocol, baseline, conflict = self._verify_protocol(store, metadata, pending)
+        allow_missing = not self.receiving and self.operation == "publish"
         local = self._snapshot("inspect_local", "正在校验本地文件内容…",
                                self.task.local_path, self.task.excludes)
         remote = self._snapshot(
             "inspect_remote", "正在校验手机文件内容；WebDAV 无哈希时需要读取内容…",
             f"{C.DEFAULT_REMOTE}:{self.task.remote_path}", self.task.excludes,
-            allow_missing=not self.receiving and self.operation == "publish",
+            allow_missing=allow_missing,
         )
         missing = remote is None
         if remote is None:
             remote = ContentSnapshot({})
-        baseline = store.load()
+        if protocol == LEGACY:
+            for snapshot in (local, remote):
+                require_legacy_paths(snapshot.directories, location="当前目录")
+                require_legacy_paths(snapshot.files, location="当前文件")
         generation = metadata["generation"] if metadata else ""
         source, destination = (remote, local) if self.receiving else (local, remote)
         marks = {}
@@ -383,7 +491,7 @@ class SyncEngine:
             original_source = pending["remote"] if self.receiving else pending["local"]
             original_destination = pending["local"] if self.receiving else pending["remote"]
             reason = "将继续上次已确认的操作；只接受原来源内容及原目标/已传输结果的组合，不自动抢占其他电脑的锁。"
-            blocked = not source.same_content(original_source)
+            blocked = source.digest != original_source.digest
             if blocked:
                 reason = "上次操作后来源又被修改，不能直接继续；请先保留两端文件并核对。"
             if self.receiving and (
@@ -393,11 +501,16 @@ class SyncEngine:
             ):
                 reason, blocked = "手机发布状态或内容已变化，不能把未完成或未经核对的数据作为续作来源。", True
             if not self.receiving:
+                allowed_directories = set(original_source.directories) | set(original_destination.directories)
                 own_publication = metadata is not None and (
                     metadata.get("writer_identity") == self.task.sync_identity
                     and metadata["generation"] == pending["generation"]
-                    and metadata.get("content_digest") == original_source.digest
-                    and (metadata["phase"] != "ready" or remote.digest == original_source.digest)
+                    and (
+                        metadata["phase"] != "ready" and metadata.get("content_digest") == original_source.digest
+                        or metadata["phase"] == "ready" and metadata.get("content_digest") == remote.digest
+                        and remote.same_content(original_source)
+                        and set(original_source.directories) <= set(remote.directories) <= allowed_directories
+                    )
                 )
                 before_publication = "prior_metadata" in pending and (
                     metadata == pending["prior_metadata"]
@@ -413,27 +526,27 @@ class SyncEngine:
                 if content not in (original_source.files.get(path), original_destination.files.get(path)):
                     reason, blocked = "未完成目标包含新的其他修改；已停止续作以避免覆盖。", True
                     break
-            missing_replacements = {
-                path for path in set(original_source.files) & set(original_destination.files)
-                if path not in destination.files
+            old_files_no_longer_at_target = {
+                path: item for path, item in original_destination.files.items()
+                if destination.files.get(path) != item
             }
-            if missing_replacements:
-                history_root = str(Path(self.task.local_history_path) / pending["stamp"]) if self.receiving else (
-                    f"{C.DEFAULT_REMOTE}:{self.task.versions_path}/{pending['stamp']}"
-                )
-                backup = self._snapshot("check_history", "正在核对原历史批次中的旧文件…",
-                                        history_root, allow_missing=True)
-                if backup is None or any(
-                    original_source.files[path] == original_destination.files[path]
-                    or backup.files.get(path) != original_destination.files[path]
-                    for path in missing_replacements
-                ):
-                    reason, blocked = "未完成目标出现文件缺失，且原历史批次不能证明旧内容已保留；请先核对再处理。", True
+            backup, history_conflict = self._verify_recovery_history(pending, protocol)
+            if history_conflict:
+                reason, blocked = history_conflict, True
+            elif any(original_source.files.get(path) == item or backup.files.get(path) != item
+                     for path, item in old_files_no_longer_at_target.items()):
+                reason, blocked = "未完成目标的部分旧文件已改变或缺失，且原历史批次不能证明旧内容已保留；请先核对再处理。", True
+        else:
+            backup = None
+        if conflict:
+            reason, blocked = f"两端未过滤的路径存在名称或文件/目录冲突；已停止操作。{conflict}", True
         token = hashlib.sha256(json.dumps([
-            self.task.id, self.task.sync_identity, self.task.dataset_id, self.operation,
-            local.digest, remote.digest, generation, missing,
+            store.binding, self.operation, protocol,
+            local.digest, remote.digest, metadata, missing,
             baseline[0].digest if baseline else None, baseline[1] if baseline else None,
-        ], ensure_ascii=False).encode("utf-8")).hexdigest()
+            [pending["lock_token"], pending["stamp"], pending["generation"], pending["local"].digest,
+             pending["remote"].digest, pending.get("prior_metadata"), backup.digest] if pending else None,
+        ], ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
         report = SyncReport(
             added=sum(mark == "+" for mark in marks.values()),
             updated=sum(mark == "*" for mark in marks.values()),
@@ -443,7 +556,7 @@ class SyncEngine:
             digest=token, operation=self.operation, blocked=blocked, reason=reason,
             requires_confirmation=bool(reason) and not blocked,
         )
-        self._plan = (local, remote, metadata, source, destination, marks)
+        self._plan = (local, remote, metadata, source, destination, marks, protocol, backup)
         self._stage("difference", report.summary)
         return report
 
@@ -455,27 +568,48 @@ class SyncEngine:
         from app.core.history import _no_links
         if report.blocked:
             raise RuntimeError(report.reason or "内容保护已阻止执行")
-        if report.operation != self.operation:
+        if not self.recovering and report.operation != self.operation:
             raise RuntimeError("操作方向与已确认差异不一致")
+        # In particular do not acquire a recovery lease on an incompatible v1
+        # journal. Repeat the same proof under the lock before writing payloads.
         store, coordinator = self._context()
         from app.core.pending import PendingOperation
         journal = PendingOperation(store)
-        interrupted = journal.load() if self.recovering else None
-        context = coordinator.recovery_lease(interrupted["lock_token"]) if interrupted and coordinator.locked() else coordinator.lease()
+        interrupted = journal.load()
+        if self.recovering:
+            if interrupted is None:
+                raise RuntimeError("没有可继续的未完成操作。")
+            self.operation = interrupted["operation"]
+            if self.operation != report.operation:
+                raise RuntimeError("操作方向与已确认差异不一致")
+        elif interrupted is not None:
+            raise RuntimeError("本机有未完成的操作；请先核对续作。")
+        self._validate()
+        has_recovery_lock = interrupted is not None and coordinator.locked()
+        if interrupted is not None and not self.receiving and not has_recovery_lock:
+            raise RuntimeError("上次发布的所有权锁已缺失；请保留两端文件和未完成记录。")
+        protocol, _, conflict = self._verify_protocol(store, coordinator.read(), interrupted)
+        if conflict:
+            raise RuntimeError(f"目标名称冲突，未写入文件：{conflict}")
+        if interrupted is not None:
+            _, history_conflict = self._verify_recovery_history(interrupted, protocol)
+            if history_conflict:
+                raise RuntimeError(history_conflict)
+        recovery_token = interrupted["lock_token"] if interrupted else None
+        context = coordinator.recovery_lease(recovery_token) if has_recovery_lock else coordinator.lease()
         self._stage("locking", "正在获取数据集保护锁…")
         with context as lease:
-            fresh = self._inspect(check_lock=False)
+            fresh = self._inspect(check_lock=False, recovery_token=recovery_token)
             if fresh.blocked:
                 raise RuntimeError(fresh.reason)
             if fresh.digest != report.digest:
                 raise RuntimeError("文件内容或发布批次已变化，请重新查看差异后确认。")
-            local, remote, metadata, source, destination, marks = self._plan
+            local, remote, metadata, source, destination, marks, protocol, backup = self._plan
             if (metadata and metadata["phase"] == "ready" and local.same_content(remote)
                     and set(source.directories).issubset(destination.directories)):
                 self._stage("saving", "文件内容没有变化；正在保存已核对的共同基线…")
-                if self.cancelled.is_set():
-                    raise RuntimeError("操作已取消")
-                store.save(remote, metadata["generation"])
+                self.begin_commit()
+                store.save(remote, metadata["generation"], protocol=protocol)
                 journal.clear()
                 self._stage("releasing", "共同基线已核对；正在释放任务锁…")
                 return ""
@@ -486,7 +620,7 @@ class SyncEngine:
             )
             source_root = f"{C.DEFAULT_REMOTE}:{self.task.remote_path}" if self.receiving else self.task.local_path
             destination_root = self.task.local_path if self.receiving else f"{C.DEFAULT_REMOTE}:{self.task.remote_path}"
-            history_root = str(Path(self.task.local_history_path) / stamp) if self.receiving else f"{C.DEFAULT_REMOTE}:{self.task.versions_path}/{stamp}"
+            history_root = self._history_root(stamp)
             payload_started = False
             try:
                 with tempfile.TemporaryDirectory(prefix="PhoneNAS-staged-") as temporary:
@@ -513,17 +647,26 @@ class SyncEngine:
                                             source_root, self.task.excludes)
                     if current.digest != destination.digest or origin.digest != source.digest:
                         raise RuntimeError("传输前文件内容发生变化；目标尚未覆盖，请重新查看差异。")
+                    conflict = self._verify_namespace(protocol, allow_missing=not self.receiving)
+                    if conflict:
+                        raise RuntimeError(f"目标名称冲突，未写入文件：{conflict}")
+                    if interrupted is not None:
+                        recent, history_conflict = self._verify_recovery_history(interrupted, protocol)
+                        if history_conflict or recent.digest != backup.digest:
+                            raise RuntimeError(history_conflict or "续作的历史批次已改变，未写入目标，请重新核对。")
+                    elif self._namespace(history_root, allow_missing=True) is not None:
+                        raise RuntimeError("本次历史批次位置已被占用，未写入目标，请重新核对。")
                     if self.cancelled.is_set():
                         raise RuntimeError("操作已取消")
                     if not interrupted:
                         journal.save(
                             operation=self.operation, local=local, remote=remote,
                             generation=generation, stamp=stamp, lock_token=lease.token,
-                            prior_metadata=metadata,
+                            prior_metadata=metadata, protocol=protocol,
                         )
                     payload_started = True
                     if not self.receiving:
-                        coordinator.write("publishing", generation, content_digest=source.digest)
+                        coordinator.write("publishing", generation, content_digest=source.digest, protocol=protocol)
                     self._stage("applying", "正在写入本地接收目录…" if self.receiving else "正在上传写入手机镜像…")
                     if not self.receiving:
                         self._require(self.rclone.mkdir(self.task.remote_path), "创建镜像目录失败")
@@ -552,23 +695,24 @@ class SyncEngine:
                         raise RuntimeError("传输后内容核对未通过；没有记录为成功，也未清理历史文件。")
                     origin_after = self._snapshot("verify_source", "正在最终复核来源内容；手机无哈希时需读取文件…",
                                                  source_root, self.task.excludes)
-                    if not origin_after.same_content(source):
+                    if origin_after.digest != source.digest:
                         raise RuntimeError("传输期间来源发生修改；已保留历史，但没有推进共同基线。")
                     self._stage("saving", "正在保存已验证结果与共同基线…")
-                    if self.cancelled.is_set():
-                        raise RuntimeError("操作已取消")
+                    self.begin_commit()
                     if not self.receiving:
-                        coordinator.write("ready", generation, content_digest=verified.digest)
-                    store.save(verified, generation)
+                        coordinator.write("ready", generation, content_digest=verified.digest, protocol=protocol)
+                    store.save(verified, generation, protocol=protocol)
                     journal.clear()
             except Exception:
                 if payload_started and not self.receiving:
                     lease.retain()
                 raise
             self._stage("cleanup", "正在检查历史保留并收尾…")
-            self._clean_history()
-            if self.cancelled.is_set():
-                raise RuntimeError("操作已取消")
+            # A v2 shared state proves the phone namespace, not the origin of
+            # existing offline history on this computer. Local batches remain
+            # available for explicit, verified deletion but are not auto-expired.
+            if protocol == LITERAL and not self.receiving:
+                self._clean_history()
             self._stage("releasing", "正在释放任务锁；尚未报告任务完成…")
             return stamp
 
@@ -671,8 +815,9 @@ class SyncEngine:
                 log_handle.close()
 
     def _clean_history(self) -> None:
-        from app.core.history import HistoryService, LocalHistoryService
-        history = LocalHistoryService(self.task) if self.receiving else HistoryService(self.rclone, self.task)
+        from app.core.history import HistoryService
+        # execute() already holds the dataset lease for this literal publication.
+        history = HistoryService(self.rclone, self.task, protocol=LITERAL)
         try:
             for name in old_versions(history.list_versions(), self.task.retention_days):
                 self._validate()
@@ -703,12 +848,32 @@ class SyncWorker(QThread):
         self.cancelled = threading.Event()
         self.rclone: Rclone | None = None
         self.outcome = "pending"
+        self._outcome_lock = threading.Lock()
+        self._committing = False
 
-    def stop(self) -> None:
-        self.cancelled.set()
+    def stop(self) -> bool:
+        with self._outcome_lock:
+            if self.outcome != "pending" or self._committing or self.cancelled.is_set():
+                return False
+            self.cancelled.set()
         self.requestInterruption()
         if self.rclone is not None:
             self.rclone.cancel()
+        return True
+
+    def _begin_commit(self) -> None:
+        with self._outcome_lock:
+            if self.cancelled.is_set():
+                raise RuntimeError("操作已取消")
+            self._committing = True
+
+    def _finish(self, outcome: str) -> str:
+        with self._outcome_lock:
+            self.outcome = "cancelled" if self.cancelled.is_set() else outcome
+            return self.outcome
+
+    def _report_cancelled(self) -> None:
+        self.cancelled_result.emit(self.task.id, "本次操作已取消；已传输内容不回滚，未清理历史文件。")
 
     def run(self) -> None:
         try:
@@ -725,31 +890,32 @@ class SyncWorker(QThread):
                     state_directory=data_dir() / "baselines", operation=self.operation,
                     progress=lambda text: self.progress.emit(self.task.id, text),
                     progress_event=lambda event: self.progress_event.emit(self.task.id, event),
+                    begin_commit=self._begin_commit,
                 )
                 report = engine.preview()
                 reason = preview_guard(self.task, report)
                 if self.preview_only:
-                    self.outcome = "preview"
-                    self.preview_ready.emit(self.task.id, report, reason)
+                    if self._finish("preview") == "cancelled":
+                        self._report_cancelled()
+                    else:
+                        self.preview_ready.emit(self.task.id, report, reason)
                     return
+                if not reason and self.approved_digest and self.approved_digest != report.digest:
+                    reason = "差异与已确认的预演不同，请重新确认。"
                 if report.blocked or (reason and self.approved_digest != report.digest):
-                    self.outcome = "guarded"
-                    self.guarded.emit(self.task.id, report, reason)
-                    return
-                if self.approved_digest and self.approved_digest != report.digest:
-                    self.outcome = "guarded"
-                    self.guarded.emit(self.task.id, report, "差异与已确认的预演不同，请重新确认。")
+                    if self._finish("guarded") == "cancelled":
+                        self._report_cancelled()
+                    else:
+                        self.guarded.emit(self.task.id, report, reason)
                     return
                 stamp = engine.execute(report)
-                if self.cancelled.is_set():
-                    raise RuntimeError("操作已取消")
-                self.outcome = "success"
-                self.finished_ok.emit(self.task.id, report, stamp)
+                if self._finish("success") == "cancelled":
+                    self._report_cancelled()
+                else:
+                    self.finished_ok.emit(self.task.id, report, stamp)
         except Exception as exc:  # noqa: BLE001
-            if self.cancelled.is_set():
-                self.outcome = "cancelled"
-                self.cancelled_result.emit(self.task.id, "本次操作已取消；已传输内容不回滚，未清理历史文件。")
+            if self._finish("failed") == "cancelled":
+                self._report_cancelled()
             else:
-                self.outcome = "failed"
                 get_logger().warning("任务 %s: %s", self.task.id, exc)
                 self.failed.emit(self.task.id, str(exc))

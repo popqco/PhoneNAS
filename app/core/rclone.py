@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -13,25 +12,23 @@ from pathlib import Path
 
 from app import constants as C
 from app.core.config import Config, app_root, data_dir
+from app.core.filenames import LITERAL_FLAGS
 from app.core.log import get_logger
 
 CREATE_NO_WINDOW = 0x08000000
+_FILENAME_COMMANDS = frozenset({"lsjson", "lsf", "hashsum", "cat", "mkdir", "copy", "copyto", "moveto", "purge", "sync"})
+# The private configuration and explicit flags, not shell-wide rclone
+# overrides, define the endpoint, names and scope checked by PhoneNAS.
+def _file_environment(args: list[str]) -> dict[str, str] | None:
+    if not args or (args[0] not in _FILENAME_COMMANDS and args[0] != "lsd"):
+        return None
+    return {key: value for key, value in os.environ.items() if not key.upper().startswith("RCLONE_")}
 
 
 def rclone_exe() -> Path:
-    bundle = Path(getattr(sys, "_MEIPASS", app_root()))
-    candidates = [
-        bundle / "vendor" / "rclone.exe",
-        app_root() / "vendor" / "rclone.exe",
-        app_root() / "rclone.exe",
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    found = shutil.which("rclone")
-    if found:
-        return Path(found)
-    return candidates[0]
+    # A different binary on PATH has not been verified against the filename
+    # protocol. Source checkouts use build/fetch-vendor.ps1, like the bundle.
+    return Path(getattr(sys, "_MEIPASS", app_root())) / "vendor" / "rclone.exe"
 
 
 @dataclass
@@ -74,6 +71,13 @@ class Rclone:
                 pass
 
     # -- process ----------------------------------------------------------
+    @staticmethod
+    def _command(exe: Path, args: list[str], conf: Path) -> list[str]:
+        # A WinFsp mount and connection check are not a payload operation.
+        # Mount keeps the Windows VFS naming behavior that Explorer expects.
+        literal = args and args[0] in _FILENAME_COMMANDS
+        return [str(exe), *args, *(LITERAL_FLAGS if literal else ()), "--config", str(conf)]
+
     def run(
         self, args: list[str], timeout: int = 120, conf_path: Path | None = None,
         cancel_event: threading.Event | None = None,
@@ -84,12 +88,12 @@ class Rclone:
         if not exe.exists():
             return Result(False, "", f"找不到 rclone: {exe}", -1)
         conf = conf_path or self.conf_path
-        cmd = [str(exe), *args, "--config", str(conf)]
+        cmd = self._command(exe, args, conf)
         proc = None
         try:
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, encoding="utf-8", errors="replace",
+                text=True, encoding="utf-8", errors="replace", env=_file_environment(args),
                 creationflags=CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
             with self._lock:
@@ -122,7 +126,7 @@ class Rclone:
         if not exe.exists():
             raise FileNotFoundError(f"找不到 rclone: {exe}")
         conf = conf_path or self.conf_path
-        cmd = [str(exe), *args, "--config", str(conf)]
+        cmd = self._command(exe, args, conf)
         stream = None
         if log_path:
             log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -132,7 +136,7 @@ class Rclone:
                 raise RuntimeError("操作已取消")
             proc = subprocess.Popen(
                 cmd, stdout=stream or subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, encoding="utf-8", errors="replace",
+                text=True, encoding="utf-8", errors="replace", env=_file_environment(args),
                 creationflags=CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
         except Exception:

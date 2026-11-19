@@ -8,6 +8,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
+from app import constants as C
 from app.core.config import Config, data_dir
 from app.core.tasks import MirrorTask, new_task
 
@@ -22,6 +23,84 @@ class ConfigV3Tests(unittest.TestCase):
         })
         environment.start()
         self.addCleanup(environment.stop)
+
+    def test_first_run_has_no_example_connection_or_automatic_mount_or_start(self) -> None:
+        fresh = Config()
+        path = fresh.path
+        self.assertFalse(path.exists())
+        self.assertEqual(fresh.url, "")
+        self.assertEqual(fresh.username, "")
+        self.assertEqual(fresh.tasks, ())
+        for key in ("mount.auto_mount", "app.start_with_windows"):
+            self.assertIs(fresh.get(key), False)
+        fresh.save()
+        loaded = Config(path)
+        self.assertEqual(loaded.load_error, "")
+        self.assertEqual(loaded.data, fresh.data)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["nas"]["url"], "")
+        self.assertEqual(payload["nas"]["username"], "")
+        self.assertIs(payload["mount"]["auto_mount"], False)
+        self.assertIs(payload["app"]["start_with_windows"], False)
+
+    def test_sparse_saved_profiles_keep_legacy_defaults_and_v1_local_source(self) -> None:
+        root = Config().path.parent
+        legacy = Path(C.DEFAULT_LOCAL_PATH) if os.name == "nt" else root / "legacy-source"
+        actual_resolve = Path.resolve
+
+        def resolve(path: Path, *args, **kwargs):
+            if path == Path("X:/") or path == legacy or (
+                path.parent == legacy.parent and path.name.startswith(f"{legacy.name}.PhoneNAS-history-")
+            ):
+                return path
+            return actual_resolve(path, *args, **kwargs)
+
+        for version in (None, 1, 2, 3):
+            with self.subTest(version=version), patch.object(Path, "resolve", resolve), \
+                    patch.object(C, "DEFAULT_LOCAL_PATH", str(legacy)):
+                path = root / f"sparse-{version}.json"
+                original = b"{}" if version is None else f'{{"version":{version}}}'.encode("utf-8")
+                path.write_bytes(original)
+                config = Config(path)
+                self.assertEqual(config.load_error, "")
+                self.assertEqual(config.url, C.DEFAULT_URL)
+                self.assertEqual(config.username, "admin")
+                self.assertIs(config.get("mount.auto_mount"), True)
+                self.assertIs(config.get("app.start_with_windows"), True)
+                if version in (None, 1):
+                    self.assertEqual(len(config.tasks), 1)
+                    self.assertEqual(config.tasks[0].local_path, C.DEFAULT_LOCAL_PATH)
+                    self.assertEqual(config.tasks[0].remote_path, "backup/work")
+                    self.assertEqual(config.tasks[0].versions_path, "backup/work-versions")
+                else:
+                    self.assertEqual(config.tasks, ())
+                self.assertEqual(path.read_bytes(), original)
+
+    def test_explicit_saved_connection_and_startup_settings_survive_load_and_save(self) -> None:
+        root = Config().path.parent
+        expected = {
+            "nas.url": "http://saved.invalid:8888",
+            "nas.username": "device-user",
+            "nas.password_enc": "opaque-dpapi",
+            "mount.enabled": False,
+            "mount.auto_mount": False,
+            "app.start_with_windows": False,
+        }
+        for version in (1, 2, 3):
+            with self.subTest(version=version):
+                path = root / f"explicit-{version}.json"
+                payload = {"version": version, "mirror": {"local_path": str(root / "source")} if version == 1 else {}}
+                for dotted, value in expected.items():
+                    section, key = dotted.split(".")
+                    payload.setdefault(section, {})[key] = value
+                path.write_text(json.dumps(payload), encoding="utf-8")
+                config = Config(path)
+                self.assertEqual(config.load_error, "")
+                self.assertEqual({key: config.get(key) for key in expected}, expected)
+                config.save()
+                reloaded = Config(path)
+                self.assertEqual(reloaded.load_error, "")
+                self.assertEqual({key: reloaded.get(key) for key in expected}, expected)
 
     def test_read_only_mount_defaults_are_safe_for_fresh_configs_and_compatible_for_migrations(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -99,7 +178,7 @@ class ConfigV3Tests(unittest.TestCase):
             loaded.upsert_task(replace(task, name="修改后"))
             loaded.set("nas.username", "changed")
             self.assertEqual(snapshot.get_task(task.id).name, "工作资料")
-            self.assertEqual(snapshot.username, "admin")
+            self.assertEqual(snapshot.username, "")
             loaded.remove_task(task.id)
             self.assertEqual(loaded.tasks, ())
             self.assertEqual(snapshot.tasks, (task,))
@@ -237,6 +316,7 @@ class ConfigV3Tests(unittest.TestCase):
 
             before = config.snapshot()
             original = config.path.read_bytes()
+            backups = list(root.glob("config.replaced-*.backup"))
             payload["mirror"]["tasks"].append(replace(task, id="other-id").to_dict())
             exported.write_text(json.dumps(payload), encoding="utf-8")
             with self.assertRaises(ValueError):
@@ -244,6 +324,89 @@ class ConfigV3Tests(unittest.TestCase):
             self.assertEqual(config.tasks, before.tasks)
             self.assertEqual(config.data, before.data)
             self.assertEqual(config.path.read_bytes(), original)
+            self.assertCountEqual(root.glob("config.replaced-*.backup"), backups)
+
+    def test_schedule_approval_stays_local_to_the_saved_config_not_an_import_or_export(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "config.json"
+            approval = "1.2.4-filenames"
+            config = Config(path)
+            config.set("app.schedule_approval", approval)
+            config.save()
+            config = Config(path)
+            self.assertEqual(config.get("app.schedule_approval"), approval)
+
+            exported = root / "exported.json"
+            config.export_to(exported)
+            payload = json.loads(exported.read_text(encoding="utf-8"))
+            self.assertNotIn("schedule_approval", payload["app"])
+            self.assertEqual(config.get("app.schedule_approval"), approval)
+
+            payload["app"]["schedule_approval"] = approval
+            exported.write_text(json.dumps(payload), encoding="utf-8")
+            config.import_from(exported)
+            self.assertIsNone(config.get("app.schedule_approval"))
+            self.assertIsNone(Config(path).get("app.schedule_approval"))
+
+    def test_import_backs_up_exact_saved_bytes_before_replacing_a_healthy_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "config.json"
+            original = (b'\xef\xbb\xbf{\r\n  "version" : 3,\r\n  "nas" : {"username": "saved"},\r\n'
+                        b'  "future_option" : [1, 2]\r\n}\r\n')
+            path.write_bytes(original)
+            config = Config(path)
+            self.assertEqual(config.load_error, "")
+            config.set("nas.username", "unsaved")
+            incoming = root / "incoming.json"
+            incoming.write_text('{"version":3,"nas":{"username":"imported"}}', encoding="utf-8")
+
+            config.import_from(incoming)
+
+            backups = list(root.glob("config.replaced-*.backup"))
+            self.assertEqual(len(backups), 1)
+            self.assertEqual(backups[0].read_bytes(), original)
+            self.assertEqual(config.username, "imported")
+            self.assertEqual(Config(path).username, "imported")
+
+    def test_failed_import_backup_leaves_the_config_untouched_and_can_be_retried(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "config.json"
+            original = b'{"version":3,"nas":{"username":"original"}}\n'
+            path.write_bytes(original)
+            config = Config(path)
+            before = config.snapshot()
+            incoming = root / "incoming.json"
+            incoming.write_text('{"version":3,"nas":{"username":"imported"}}', encoding="utf-8")
+            real_open = Path.open
+
+            def fail_backup_write(file: Path, mode: str = "r", *args, **kwargs):
+                stream = real_open(file, mode, *args, **kwargs)
+                if file.name.startswith("config.replaced-") and mode == "xb":
+                    write = stream.write
+
+                    def partial_write(data: bytes) -> int:
+                        write(data[:1])
+                        raise OSError("simulated backup write failure")
+
+                    stream.write = partial_write
+                return stream
+
+            with patch.object(Path, "open", fail_backup_write), self.assertRaisesRegex(OSError, "backup write failure"):
+                config.import_from(incoming)
+
+            self.assertEqual(path.read_bytes(), original)
+            self.assertEqual(config.data, before.data)
+            self.assertEqual(config.load_error, before.load_error)
+            self.assertFalse(path.with_suffix(".tmp").exists())
+            self.assertEqual(list(root.glob("*.backup")), [])
+            config.import_from(incoming)
+            backups = list(root.glob("config.replaced-*.backup"))
+            self.assertEqual(len(backups), 1)
+            self.assertEqual(backups[0].read_bytes(), original)
+            self.assertEqual(config.username, "imported")
 
     def test_import_resets_success_and_baseline_authority_without_changing_dataset_binding(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -258,6 +421,7 @@ class ConfigV3Tests(unittest.TestCase):
             source.export_to(incoming)
             destination = Config(root / "subscriber.json")
             destination.import_from(incoming)
+            self.assertEqual(list(root.glob("subscriber.replaced-*.backup")), [])
             imported = destination.tasks[0]
             self.assertEqual(imported.id, task.id)
             self.assertEqual(imported.dataset_id, task.dataset_id)

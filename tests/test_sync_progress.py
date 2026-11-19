@@ -338,6 +338,7 @@ class SyncProgressIntegrationTests(unittest.TestCase):
                 self.wait_for(lambda: lease.release_entered.is_set() or not worker.isRunning())
                 self.assertTrue(lease.release_entered.is_set(), events.errors)
                 release_checkpoint = (worker.outcome, list(events.ok), events.structured[-1][1])
+                self.assertFalse(worker.stop(), "a lock-release phase cannot be cancelled after baseline commit")
             finally:
                 self.finish_worker(worker, client, lease)
         self.assertTrue(checkpoint["running"])

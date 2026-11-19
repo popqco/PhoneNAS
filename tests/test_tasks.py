@@ -275,6 +275,77 @@ class TaskIsolationTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 validate_tasks([replace(task, remote_path="backup//docs/mirror/")])
 
+    @unittest.skipUnless(os.name == "nt", "Windows drive roots")
+    def test_unavailable_mount_drive_does_not_block_an_unrelated_source_or_allow_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            source.mkdir()
+            alias = root / "mount-alias"
+            unavailable = root / "unavailable-source"
+            mount = Path("X:/")
+            actual_resolve = Path.resolve
+
+            def resolve(path: Path, *args, **kwargs):
+                if path in (mount, unavailable):
+                    raise OSError(0, "offline fixture", str(path), 1005)
+                if path == alias:
+                    return mount / "source"
+                return actual_resolve(path, *args, **kwargs)
+
+            with patch.object(Path, "resolve", resolve):
+                valid = new_task(str(source))
+                for drive in ("X:", "x:/", "X:\\"):
+                    with self.subTest(drive=drive):
+                        validate_tasks([valid], mount_drive=drive)
+                        self.assertEqual(validate_source(valid, mount_drive=drive), actual_resolve(source))
+                        for local in (str(mount / "direct"), str(alias)):
+                            with self.subTest(local=local), self.assertRaisesRegex(ValueError, "挂载盘"):
+                                validate_source(new_task(local), mount_drive=drive)
+                with self.assertRaisesRegex(ValueError, "挂载盘"):
+                    validate_tasks([replace(valid, local_history_path=str(alias))])
+                with self.assertRaisesRegex(ValueError, "无法解析本地来源"):
+                    validate_source(new_task(str(unavailable)))
+
+    @unittest.skipUnless(os.name == "nt", "Windows drive roots")
+    def test_reachable_drive_alias_cannot_be_used_by_its_canonical_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source"
+            source.mkdir()
+            task = new_task(str(source))
+            canonical = source.resolve()
+            actual_resolve = Path.resolve
+
+            def resolve(path: Path, *args, **kwargs):
+                if path == Path("X:/"):
+                    return canonical  # Simulate a drive alias to the test directory.
+                return actual_resolve(path, *args, **kwargs)
+
+            with patch.object(Path, "resolve", resolve), self.assertRaisesRegex(ValueError, "挂载目录"):
+                validate_source(task)
+
+    def test_configured_directory_mount_resolves_separately_and_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            mount = root / "mount"
+            source.mkdir()
+            mount.mkdir()
+            task = new_task(str(source))
+            canonical = source.resolve()
+            self.assertEqual(validate_source(task, mount_drive=str(mount)), canonical)
+            with self.assertRaisesRegex(ValueError, "挂载目录"):
+                validate_tasks([new_task(str(mount / "child"))], mount_drive=str(mount))
+            actual_resolve = Path.resolve
+
+            def resolve(path: Path, *args, **kwargs):
+                if path == mount:
+                    raise OSError(0, "offline fixture", str(path), 1005)
+                return actual_resolve(path, *args, **kwargs)
+
+            with patch.object(Path, "resolve", resolve), self.assertRaisesRegex(ValueError, "无法解析.*挂载目录"):
+                validate_source(task, mount_drive=str(mount))
+
     def test_real_junction_aliases_and_mounted_directory_aliases_are_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

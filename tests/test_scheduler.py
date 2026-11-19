@@ -4,7 +4,7 @@ import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta
 
-from PySide6.QtCore import QCoreApplication, QElapsedTimer, QTimer
+from PySide6.QtCore import QCoreApplication, QElapsedTimer
 from PySide6.QtTest import QTest
 
 from app.core.scheduler import Scheduler, TaskQueue
@@ -218,6 +218,32 @@ class TaskQueueTests(unittest.TestCase):
         self.assertFalse(queue.paused)
         self.assertEqual(queue.take_next(now + timedelta(minutes=1)), "two")
 
+    def test_skipped_manual_preview_defers_only_its_overdue_automatic_request(self) -> None:
+        now = datetime(2026, 11, 14, 10, 0)
+        later = task("later", last="2026-11-14 09:59:00")
+        queue = TaskQueue([task("automatic"), task("preview"), later], now=now)
+        queue.due(now)
+        queue.enqueue("preview", manual=True)
+        queue.pause()
+        self.assertEqual(queue.take_next_request(), ("preview", True))
+        self.assertIsNone(queue.take_next_request())
+        queue.skip_preview("preview", now)
+        self.assertIsNone(queue.take_next_request())
+        queue.resume(now + timedelta(minutes=1))
+        self.assertEqual(queue.next_for("preview"), now + timedelta(minutes=5))
+        self.assertEqual(queue.next_for("later"), now + timedelta(minutes=4))
+        self.assertEqual(queue.take_next_request(), ("automatic", False))
+        queue.complete("automatic", now + timedelta(minutes=1))
+        self.assertIsNone(queue.take_next_request())
+
+        # A card preview does not claim the slot; its due automatic job may be queued.
+        queue.skip_preview("later", now + timedelta(minutes=1))
+        self.assertEqual(queue.next_for("later"), now + timedelta(minutes=4))
+        self.assertEqual(queue.due(now + timedelta(minutes=4)), ["later"])
+        queue.skip_preview("later", now + timedelta(minutes=4))
+        self.assertEqual(queue.queued_ids, ())
+        self.assertEqual(queue.due(now + timedelta(minutes=5)), ["preview"])
+
 
 class SchedulerAdapterTests(unittest.TestCase):
     @classmethod
@@ -251,6 +277,28 @@ class SchedulerAdapterTests(unittest.TestCase):
             scheduler.stop()
             scheduler.complete("new")
             self.assertTrue(scheduler.queue.paused)
+        finally:
+            scheduler.stop()
+            scheduler.deleteLater()
+
+    def test_start_and_restart_never_clear_a_pause(self) -> None:
+        scheduler = Scheduler([task("due")])
+        dispatched = []
+        scheduler.ready.connect(lambda: dispatched.append(scheduler.queue.take_next_request()))
+        try:
+            scheduler.pause()
+            scheduler.start()
+            scheduler._on_timeout()
+            self.assertTrue(scheduler.paused)
+            self.assertEqual(scheduler.queue.queued_ids, ())
+            self.assertEqual(dispatched, [None, None])
+            scheduler.stop()
+            scheduler.start()
+            self.assertTrue(scheduler.paused)
+            self.assertEqual(dispatched, [None, None, None])
+            scheduler.resume()
+            self.assertFalse(scheduler.paused)
+            self.assertEqual(dispatched[-1], ("due", False))
         finally:
             scheduler.stop()
             scheduler.deleteLater()

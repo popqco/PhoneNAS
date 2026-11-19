@@ -116,6 +116,7 @@ class TaskDialog(QDialog):
         self._loading = True
         self._previous_preset = ""
         self._custom_rules = "\n".join(self._draft.excludes)
+        self._initial_custom_text: str | None = None
         self.setWindowTitle("添加同步任务 · PhoneNAS" if self._is_new else "编辑同步任务 · PhoneNAS")
         self.setModal(True)
         available = self.screen().availableGeometry()
@@ -531,6 +532,8 @@ class TaskDialog(QDialog):
             self.rules_summary.setText("不使用排除规则。所有文件都会参与同步，首次传输可能更多。")
         else:
             self.excludes_edit.setPlainText(self._custom_rules)
+            if self._initial_custom_text is None:
+                self._initial_custom_text = self.excludes_edit.toPlainText()
             self.excludes_edit.setVisible(True)
             self.rules_summary.setText("每行一个 rclone 匹配规则。请确认没有误排除需要备份的文件。")
 
@@ -554,7 +557,14 @@ class TaskDialog(QDialog):
             self.remote_edit.setFocus()
             return
         preset = str(self.preset_combo.currentData())
-        patterns = tuple(C.RECOMMENDED_EXCLUDES) if preset == "recommended" else () if preset == "none" else tuple(line.strip() for line in self.excludes_edit.toPlainText().splitlines() if line.strip())
+        if preset == "recommended":
+            patterns = tuple(C.RECOMMENDED_EXCLUDES)
+        elif preset == "custom":
+            text = self.excludes_edit.toPlainText()
+            patterns = (self._draft.excludes if text == self._initial_custom_text
+                        else tuple(line for line in text.split("\n") if line))
+        else:
+            patterns = ()
         drive = self.config.get("mount.drive", C.DEFAULT_DRIVE)
         try:
             remote = normalize_remote_path(self.remote_edit.text())

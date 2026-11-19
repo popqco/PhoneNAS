@@ -6,7 +6,7 @@ import tempfile
 import threading
 import time
 import unittest
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from unittest.mock import patch
 from dataclasses import replace
 from pathlib import Path
@@ -43,7 +43,7 @@ class HistoryInventoryTests(unittest.TestCase):
     def test_rejected_name_identifies_path_and_invisible_character_safely(self):
         from app.core.history import validate_history_inventory
 
-        for character in ("\x7f", "\x85", "\u200b", "\u061c", "\u200e", "\u200f", "\u202a",
+        for character in ("\x85", "\u061c", "\u200e", "\u200f", "\u202a",
                           "\u202e", "\u2066", "\u2069", "\ud800", "\udfff", "\r", "\n"):
             path = f"drawings/{character}260702/part.txt"
             with self.subTest(character=ascii(character)):
@@ -84,8 +84,8 @@ class FakeRclone:
         self.dirs = Result(True, f"{OLDER}/\n{VERSION}/\n", "", 0)
         self.files = Result(True, "notes.txt\nphotos/image.jpg\n", "", 0)
         self.inventory = Result(True, json.dumps([
-            {"Path": "notes.txt", "IsDir": False},
-            {"Path": "photos/image.jpg", "IsDir": False},
+            {"Path": "notes.txt", "IsDir": False, "Size": 5},
+            {"Path": "photos/image.jpg", "IsDir": False, "Size": 8},
         ]), "", 0)
         self.copied = Result(True, "", "", 0)
         self.purged = Result(True, "", "", 0)
@@ -100,6 +100,8 @@ class FakeRclone:
 
     def run(self, args, timeout=120):
         self.calls.append(("run", tuple(args), timeout))
+        if args[:1] == ["cat"] or "--stat" in args:
+            return Result(False, "", "missing", 3)
         return self.inventory
 
     def copyto(self, source, destination):
@@ -130,6 +132,9 @@ class HistoryServiceTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.task = make_task(self.root / "source")
         self.client = FakeRclone()
+        lease = patch("app.core.relay.DatasetCoordinator._new_lease", return_value=nullcontext())
+        lease.start()
+        self.addCleanup(lease.stop)
 
     def test_versions_only_show_strict_real_timestamps_from_selected_task(self):
         self.client.dirs = Result(
@@ -164,7 +169,7 @@ class HistoryServiceTests(unittest.TestCase):
             "dir/./file.txt", "dir/../file.txt", "dir/", "file.txt.", "file.txt ",
             "dir./file.txt", "dir /file.txt", "file:stream", "NUL", "CON.txt",
             "aux/data.txt", "COM1.log", "LPT9", "COM¹.txt", "conin$", "CLOCK$.log",
-            "bad\x00name", "bad\rname", "bad\tname", "bad\u202ename", "bad\x7fname",
+            "bad\x00name", "bad\rname", "bad\tname", "bad\u202ename",
             "question?.txt", "star*.txt", 'quote".txt', "pipe|.txt", "less<.txt",
         ]
         for path in unsafe:
@@ -249,7 +254,7 @@ class HistoryServiceTests(unittest.TestCase):
         self.client.inventory = Result(True, '[]', "", 0)
         self.client.calls.clear()
         service.delete(VERSION)
-        self.assertEqual([call[0] for call in self.client.calls], ["lsf_dirs", "run", "purge"])
+        self.assertEqual([call[0] for call in self.client.calls], ["lsf_dirs", "run", "run", "run", "run", "purge"])
         self.assertEqual(self.client.calls[-1], ("purge", f"backup/task-a/versions/{VERSION}"))
 
     def test_restore_validates_all_files_before_writes_and_reports_partial_failure(self):
@@ -787,6 +792,9 @@ class VersionsPageTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         root = Path(self.temp.name)
+        lease = patch("app.core.relay.DatasetCoordinator._new_lease", return_value=nullcontext())
+        lease.start()
+        self.addCleanup(lease.stop)
         self.config = MemoryConfig([
             make_task(root / "a"),
             make_task(root / "b", id="task-b", name="照片", remote_path="backup/task-b/mirror", versions_path="backup/task-b/versions"),

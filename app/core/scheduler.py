@@ -108,7 +108,7 @@ class TaskQueue:
         self.due(now)
 
     def claim(self, task_id: str) -> bool:
-        """Reserve the serial slot for an explicit, already-confirmed relay job."""
+        """Reserve the serial slot for an explicit, already-confirmed job."""
         task = self._tasks.get(task_id)
         if self._active is not None or task is None or not task.enabled:
             return False
@@ -117,6 +117,11 @@ class TaskQueue:
         return True
 
     def take_next(self, now: datetime | None = None) -> str | None:
+        request = self.take_next_request()
+        return request[0] if request is not None else None
+
+    def take_next_request(self) -> tuple[str, bool] | None:
+        """Reserve the slot and return (task ID, needs manual preview)."""
         if self._active is not None:
             return None
         for task_id, manual in self._queued.items():
@@ -124,8 +129,19 @@ class TaskQueue:
                 continue
             del self._queued[task_id]
             self._active = task_id
-            return task_id
+            return task_id, manual
         return None
+
+    def skip_preview(self, task_id: str, now: datetime | None = None) -> None:
+        """Skip this attempt, including any automatic request already due for it."""
+        if self._active == task_id:
+            self._active = None
+        if self._queued.get(task_id) is False:
+            del self._queued[task_id]
+        when = self._next.get(task_id)
+        current = now or datetime.now()
+        if when is not None and when <= current:
+            self._next[task_id] = current + timedelta(minutes=self._tasks[task_id].interval_minutes)
 
     def complete(self, task_id: str, now: datetime | None = None) -> None:
         if self._active != task_id:
@@ -150,7 +166,7 @@ class TaskQueue:
 
 
 class Scheduler(QObject):
-    """Qt wake-up adapter. The main window owns dispatch via queue.take_next()."""
+    """Qt wake-up adapter. The main window owns dispatch via queue.take_next_request()."""
 
     ready = Signal()
 
@@ -174,7 +190,7 @@ class Scheduler(QObject):
     def start(self) -> None:
         self._started = True
         self._timer.start()
-        self.queue.resume()
+        self.queue.due()
         self.ready.emit()
 
     def stop(self) -> None:

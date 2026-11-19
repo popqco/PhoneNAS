@@ -15,6 +15,17 @@ try {
         if ($LASTEXITCODE -ne 0) { throw 'Dependency installation failed.' }
     }
 
+    $vendorHashes = @{
+        'vendor/rclone.exe' = 'acd80683e23151e93bbe0d6ffa74d26e542ec510332f630beecb9944f8d1a623'
+        'vendor/winfsp.msi' = '073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a'
+    }
+    foreach ($path in $vendorHashes.Keys) {
+        if (!(Test-Path -LiteralPath $path -PathType Leaf) -or
+            (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ne $vendorHashes[$path]) {
+            throw "Vendor file is missing or does not match the pinned SHA256: $path. Run build/fetch-vendor.ps1."
+        }
+    }
+
     Write-Host '== build with PyInstaller =='
     python -m PyInstaller --noconfirm --clean build/PhoneNAS.spec
     if ($LASTEXITCODE -ne 0) { throw 'PyInstaller build failed.' }

@@ -93,7 +93,8 @@ def decrypt_password(encoded: str) -> str:
 
 # --------------------------------------------------------------------------- config
 
-DEFAULTS: dict[str, Any] = {
+# Preserve the meaning of omitted fields in v1-v3 files, including imports.
+_SAVED_DEFAULTS: dict[str, Any] = {
     "version": 3,
     "nas": {
         "url": C.DEFAULT_URL,
@@ -130,6 +131,14 @@ def _deep_merge(base: dict, incoming: dict) -> dict:
     return out
 
 
+# First-run defaults must not change the behavior of older saved profiles.
+DEFAULTS: dict[str, Any] = _deep_merge(_SAVED_DEFAULTS, {
+    "nas": {"url": "", "username": ""},
+    "mount": {"auto_mount": False},
+    "app": {"start_with_windows": False},
+})
+
+
 def _decode_config(incoming: Any) -> tuple[dict[str, Any], bool]:
     if not isinstance(incoming, dict):
         raise ValueError("配置必须是 JSON 对象")
@@ -139,13 +148,13 @@ def _decode_config(incoming: Any) -> tuple[dict[str, Any], bool]:
     for section in ("nas", "mount", "mirror", "app"):
         if section in incoming and not isinstance(incoming[section], dict):
             raise ValueError(f"{section} 配置必须是对象")
-    data = _deep_merge(DEFAULTS, incoming)
+    data = _deep_merge(_SAVED_DEFAULTS, incoming)
     if version in (1, 2) and "read_only" not in incoming.get("mount", {}):
         # Existing installations may intentionally use a writable mount; new
         # configurations default read-only without silently changing old ones.
         data["mount"]["read_only"] = False
     for section in ("nas", "mount", "app"):
-        for key, default in DEFAULTS[section].items():
+        for key, default in _SAVED_DEFAULTS[section].items():
             if type(data[section][key]) is not type(default):
                 raise ValueError(f"{section}.{key} 配置类型不正确")
     if type(data["mirror"]["enabled"]) is not bool:
@@ -363,6 +372,7 @@ class Config:
     def export_to(self, path: Path) -> None:
         payload = copy.deepcopy(self.data)
         payload.setdefault("nas", {})["password_enc"] = ""
+        payload.setdefault("app", {}).pop("schedule_approval", None)
         Path(path).write_text(
             json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
         )
@@ -383,20 +393,35 @@ class Config:
             for item in payload["mirror"]["tasks"]
         ]
         draft.data["app"]["last_sync_at"] = ""
+        # Opt-in applies to this runtime's reviewed settings, not a replacement.
+        draft.data["app"].pop("schedule_approval", None)
         draft._load_error = ""
         draft._migrated = migrated
-        if self.load_error and self._migration_original is None and self.path.exists():
+        # Back up the file being replaced, not the normalized in-memory config.
+        try:
             original = self.path.read_bytes()
+        except FileNotFoundError:
+            pass
+        else:
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
             suffix = 0
             while True:
                 unique = f"-{suffix}" if suffix else ""
                 backup_path = self.path.with_name(f"{self.path.stem}.replaced-{stamp}{unique}.backup")
                 try:
-                    with backup_path.open("xb") as backup:
-                        backup.write(original)
-                    break
+                    backup = backup_path.open("xb")
                 except FileExistsError:
                     suffix += 1
+                    continue
+                try:
+                    with backup:
+                        backup.write(original)
+                except OSError:
+                    try:
+                        backup_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    raise
+                break
         draft.save()
         self.apply_snapshot(draft)

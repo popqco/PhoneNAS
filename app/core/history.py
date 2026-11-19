@@ -6,11 +6,15 @@ import re
 import shutil
 import stat
 import tempfile
-import unicodedata
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterable
 
 from app import constants as C
+from app.core.filenames import (
+    LEGACY, LITERAL, display_path as display_path, is_legacy_ambiguous, portable_name_key,
+    relative_parts, require_legacy_paths,
+)
 from app.core.retention import parse_version_name
 from app.core.tasks import MirrorTask
 
@@ -25,44 +29,6 @@ def _version_name(name: str) -> str:
     return name
 
 
-_RESERVED = re.compile(r"^(CON|PRN|AUX|NUL|CLOCK\$|CONIN\$|CONOUT\$|COM[1-9¹²³]|LPT[1-9¹²³])$", re.IGNORECASE)
-
-
-def display_path(path: str) -> str:
-    """Keep names readable while exposing controls and invisible Unicode safely."""
-    return "".join(
-        f"<U+{ord(char):04X}>" if unicodedata.category(char).startswith("C")
-        or char in ("\u2028", "\u2029") else char for char in path
-    )
-
-
-def _relative_path(path: str) -> tuple[str, ...]:
-    """One portable spelling, with no Win32 canonicalization or ADS aliases."""
-    if not isinstance(path, str) or not path:
-        raise ValueError("文件路径必须是非空的相对路径")
-    shown = display_path(path)
-    if "\\" in path:
-        raise ValueError(f"文件路径不能包含反斜杠：{shown}")
-    for char in path:
-        category = unicodedata.category(char)
-        # Joiners are needed for emoji and written languages. Private-use and
-        # unassigned characters are valid names, not control characters.
-        if category in ("Cc", "Cs") or category == "Cf" and char not in ("\u200c", "\u200d"):
-            raise ValueError(
-                f"文件或文件夹名称含不支持的字符 U+{ord(char):04X}：{shown}。"
-                "请先检查该名称；软件没有改名或跳过文件。"
-            )
-    parts = tuple(path.split("/"))
-    for part in parts:
-        if not part or part in (".", "..") or part.endswith((".", " ")):
-            raise ValueError(f"文件路径包含空段、上级路径或末尾点/空格：{shown}")
-        if any(char in '<>:"|?*' for char in part):
-            raise ValueError(f"文件路径包含 Windows 非法字符：{shown}")
-        if _RESERVED.fullmatch(part.split(".", 1)[0].rstrip(" .")):
-            raise ValueError(f"文件路径包含 Windows 保留设备名：{shown}")
-    return parts
-
-
 def validate_history_inventory(
     paths: Iterable[str], directories: Iterable[str] = (),
 ) -> list[str]:
@@ -75,10 +41,10 @@ def validate_history_inventory(
     aliases: dict[tuple[str, ...], tuple[tuple[str, ...], bool]] = {}
 
     def add(path: str, file_entry: bool) -> None:
-        parts = _relative_path(path)
+        parts = relative_parts(path)
         for length in range(1, len(parts) + 1):
             spelling = parts[:length]
-            key = tuple(unicodedata.normalize("NFC", part).casefold() for part in spelling)
+            key = tuple(map(portable_name_key, spelling))
             is_file = file_entry and length == len(parts)
             previous = aliases.get(key)
             if previous is not None:
@@ -112,17 +78,49 @@ def _within(path: Path, parent: Path) -> bool:
 
 
 class HistoryService:
-    """History batches for exactly one immutable mirror task, without Qt or config IO."""
+    """History batches for one task; infer the protocol from shared state for standalone actions."""
 
-    def __init__(self, rclone, task: MirrorTask):
+    def __init__(self, rclone, task: MirrorTask, *, protocol: int | None = None, lease_factory=None):
         if not isinstance(task, MirrorTask):
             raise ValueError("历史文件必须关联有效任务")
-        versions = tuple(part.casefold() for part in _relative_path(task.versions_path))
-        remote = tuple(part.casefold() for part in _relative_path(task.remote_path))
+        versions = tuple(map(portable_name_key, relative_parts(task.versions_path)))
+        remote = tuple(map(portable_name_key, relative_parts(task.remote_path)))
         if versions[:len(remote)] == remote or remote[:len(versions)] == versions:
             raise ValueError("历史目录不能与任务镜像目录重叠")
         self.rclone = rclone
         self.task = task
+        self.protocol = protocol
+        self._lease_factory = lease_factory
+
+    @contextmanager
+    def _history_lease(self):
+        from app.core.relay import DatasetCoordinator
+
+        if self.protocol is not None:
+            # SyncEngine provides the checked protocol while holding its lease.
+            yield
+            return
+        coordinator = DatasetCoordinator(self.rclone, self.task, lease_factory=self._lease_factory)
+        if coordinator.locked():
+            raise RuntimeError("数据集有其他操作或未完成发布；不会接管其锁或修改历史文件。")
+        with coordinator.lease():
+            state = coordinator.read()
+            if state is not None and state["phase"] != "ready":
+                raise RuntimeError("数据集有未完成发布；不能恢复或删除手机历史。")
+            yield
+
+    def _require_batch_names(self, paths: list[str]) -> None:
+        from app.core.relay import DatasetCoordinator
+
+        names = [self.task.versions_path, *paths]
+        if not any(map(is_legacy_ambiguous, names)):
+            return  # An ordinary batch needs no network round-trip for protocol.
+        protocol = self.protocol
+        if protocol is None:
+            state = DatasetCoordinator(self.rclone, self.task).read()
+            protocol = state["version"] if state else LEGACY
+        if protocol != LITERAL:
+            require_legacy_paths(names, location="历史批次路径")
 
     def list_versions(self) -> list[str]:
         result = self.rclone.lsf_dirs(self.task.versions_path)
@@ -142,7 +140,7 @@ class HistoryService:
         version = _version_name(version)
         result = self.rclone.run([
             "lsjson", f"{C.DEFAULT_REMOTE}:{self.task.versions_path}/{version}",
-            "--recursive", "--files-only", "--no-modtime", "--no-mimetype",
+            "--recursive", "--no-modtime", "--no-mimetype",
         ], timeout=120)
         if not result.ok:
             raise RuntimeError(f"读取历史文件清单失败：{result.err or result.out or result.code}")
@@ -152,15 +150,22 @@ class HistoryService:
             raise RuntimeError("远端返回了无效的历史文件清单") from exc
         if not isinstance(entries, list):
             raise RuntimeError("远端返回了无效的历史文件清单")
-        paths = []
+        paths, directories = [], []
         for entry in entries:
-            if not isinstance(entry, dict) or entry.get("IsDir") is not False:
+            if not isinstance(entry, dict) or type(entry.get("IsDir")) is not bool:
                 raise ValueError("远端文件清单包含无效项")
-            paths.append(entry.get("Path"))
-        return validate_history_inventory(paths)
+            (directories if entry["IsDir"] else paths).append(entry.get("Path"))
+        names = validate_history_inventory(paths, directories)
+        self._require_batch_names([*directories, *names])
+        return names
 
     def restore(self, version: str, destination: Path, files: Iterable[str] | None = None) -> Path:
         version = _version_name(version)
+        self.list_files(version)
+        with self._history_lease():
+            return self._restore(version, destination, files)
+
+    def _restore(self, version: str, destination: Path, files: Iterable[str] | None) -> Path:
         # Validate the *entire* inventory even for a selected-file restore. Never
         # pass an untrusted tree to rclone copy/sync, or partially trust a listing.
         available = self.list_files(version)
@@ -171,7 +176,7 @@ class HistoryService:
                 raise ValueError("请选择文件列表，而不是单个路径字符串")
             selected = list(files)
             for path in selected:
-                _relative_path(path)
+                relative_parts(path)
             if len(set(selected)) != len(selected) or any(path not in available for path in selected):
                 raise ValueError("选择的文件不在当前历史批次中或有重复")
         if not selected:
@@ -183,8 +188,9 @@ class HistoryService:
             raise ValueError("请选择一个已存在的本地恢复目录")
         destination = destination.resolve(strict=True)
         local = Path(os.path.abspath(self.task.local_path)).resolve()
-        if _within(destination, local):
-            raise ValueError("恢复目录不能位于任务的本地源文件夹内")
+        local_history = Path(os.path.abspath(self.task.local_history_path)).resolve()
+        if _within(destination, local) or _within(destination, local_history):
+            raise ValueError("恢复目录不能位于任务的本地源文件夹或历史目录内")
         # mkdtemp creates an exclusive, new child even when a prior recovery of
         # the same timestamp exists. No user path is ever used as an overwrite.
         target = Path(tempfile.mkdtemp(prefix=f"PhoneNAS-{version}-", dir=destination))
@@ -194,7 +200,7 @@ class HistoryService:
             if not _within(target.resolve(strict=True), destination):
                 raise ValueError("恢复目录超出所选目录")
             for relative in selected:
-                output = target.joinpath(*_relative_path(relative))
+                output = target.joinpath(*relative_parts(relative))
                 _no_links(output)
                 if not _within(output.resolve(), target.resolve(strict=True)):
                     raise ValueError("恢复文件超出专用恢复目录")
@@ -221,14 +227,17 @@ class HistoryService:
         version = _version_name(version)
         if version not in self.list_versions():
             raise ValueError("该历史批次已不在当前任务的远端列表中；请刷新后重试")
-        # Fail closed on unreadable, malformed or unsafe content; a timestamp
-        # alone is not authority to purge an arbitrary remote subtree.
         self.list_files(version)
-        result = self.rclone.purge(f"{self.task.versions_path}/{version}")
-        if not result.ok:
-            raise RuntimeError(
-                f"永久删除未确认完成，远端可能已部分删除；请刷新检查：{result.err or result.out or result.code}"
-            )
+        with self._history_lease():
+            # Recheck the whole batch, including empty directories, under the
+            # shared lock. A timestamp alone is not authority to purge it.
+            if self.protocol is None:
+                self.list_files(version)
+            result = self.rclone.purge(f"{self.task.versions_path}/{version}")
+            if not result.ok:
+                raise RuntimeError(
+                    f"永久删除未确认完成，远端可能已部分删除；请刷新检查：{result.err or result.out or result.code}"
+                )
 
 
 def _absolute_local_path(value: str | os.PathLike[str]) -> Path:
@@ -239,7 +248,7 @@ def _absolute_local_path(value: str | os.PathLike[str]) -> Path:
     path = Path(raw)
     if not path.is_absolute() or path == Path(path.anchor):
         raise ValueError("本地历史和恢复目录必须是非根目录的绝对路径")
-    _relative_path("/".join(path.parts[1:]))
+    relative_parts("/".join(path.parts[1:]))
     _no_links(path)
     return path.resolve()
 
@@ -247,8 +256,8 @@ def _absolute_local_path(value: str | os.PathLike[str]) -> Path:
 def _local_overlap(left: Path, right: Path) -> bool:
     # Refuse aliases even on a case-sensitive host: histories are portable to
     # Windows, and normalization aliases must not evade the isolation check.
-    first = tuple(unicodedata.normalize("NFC", part).casefold() for part in left.parts)
-    second = tuple(unicodedata.normalize("NFC", part).casefold() for part in right.parts)
+    first = tuple(map(portable_name_key, left.parts))
+    second = tuple(map(portable_name_key, right.parts))
     length = min(len(first), len(second))
     return first[:length] == second[:length]
 
@@ -302,7 +311,7 @@ class LocalHistoryService:
                 _no_links(directory)
                 for entry in directory.iterdir():
                     relative = entry.relative_to(batch).as_posix()
-                    _relative_path(relative)
+                    relative_parts(relative)
                     _no_links(entry)
                     info = entry.lstat()
                     if stat.S_ISDIR(info.st_mode):
@@ -332,7 +341,7 @@ class LocalHistoryService:
                 raise ValueError("请选择文件列表，而不是单个路径字符串")
             selected = list(files)
             for path in selected:
-                _relative_path(path)
+                relative_parts(path)
             if len(set(selected)) != len(selected) or any(path not in available for path in selected):
                 raise ValueError("选择的文件不在当前历史批次中或有重复")
         if not selected:
@@ -347,7 +356,7 @@ class LocalHistoryService:
         try:
             for relative in selected:
                 source = self.root / version / relative
-                output = target.joinpath(*_relative_path(relative))
+                output = target.joinpath(*relative_parts(relative))
                 _no_links(source)
                 info = source.lstat()
                 if not stat.S_ISREG(info.st_mode):
@@ -383,13 +392,13 @@ class LocalHistoryService:
             # Never hand a tree to rmtree: only unlink the validated inventory,
             # and inspect each entry and every ancestor again before mutation.
             for relative in files:
-                path = batch.joinpath(*_relative_path(relative))
+                path = batch.joinpath(*relative_parts(relative))
                 _no_links(path)
                 if not stat.S_ISREG(path.lstat().st_mode):
                     raise ValueError("本地历史文件已改变；请刷新后重试")
                 path.unlink()
             for relative in sorted(directories, key=lambda item: len(item.split("/")), reverse=True):
-                path = batch.joinpath(*_relative_path(relative))
+                path = batch.joinpath(*relative_parts(relative))
                 _no_links(path)
                 if not stat.S_ISDIR(path.lstat().st_mode):
                     raise ValueError("本地历史目录已改变；请刷新后重试")

@@ -1,5 +1,5 @@
 #define MyAppName "PhoneNAS"
-#define MyAppVersion "1.2.3"
+#define MyAppVersion "1.2.4"
 #define MyAppExeName "PhoneNAS.exe"
 
 [Setup]
@@ -23,7 +23,7 @@ Name: "chinesesimp"; MessagesFile: "ChineseSimplified.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加任务："
-Name: "autostart"; Description: "开机自动启动 PhoneNAS"; GroupDescription: "附加任务："
+Name: "autostart"; Description: "开机自动启动 PhoneNAS"; GroupDescription: "附加任务："; Flags: unchecked
 
 [Files]
 Source: "..\dist\PhoneNAS\*"; DestDir: "{app}"; Excludes: "portable.flag,data\*,baselines\*,logs\*"; Flags: recursesubdirs createallsubdirs ignoreversion

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from app import constants as C
+from app.core.filenames import portable_name_key, relative_parts
 
 
 MIN_INTERVAL_MINUTES = 1
@@ -169,7 +170,7 @@ def normalize_remote_path(path: str) -> str:
     parts = [part for part in value.split("/") if part]
     if not parts or any(part in (".", "..") or part != part.strip() or part.endswith(".") for part in parts):
         raise ValueError("远端目录不能包含空白或 . / .. 路径段")
-    return "/".join(parts)
+    return "/".join(relative_parts("/".join(parts)))
 
 
 def _plain_local_name(value: str) -> str:
@@ -185,7 +186,7 @@ def _plain_local_name(value: str) -> str:
 
 
 def _path_parts(path: Path) -> tuple[str, ...]:
-    return tuple(part.casefold() for part in Path(_plain_local_name(str(path))).parts)
+    return tuple(map(portable_name_key, Path(_plain_local_name(str(path))).parts))
 
 
 def _overlap(left: tuple[str, ...], right: tuple[str, ...]) -> bool:
@@ -208,16 +209,23 @@ def _source_path(task: MirrorTask, mount_drive: str, *, history: bool = False) -
         raise ValueError("不能把 PhoneNAS 挂载盘作为来源")
     try:
         canonical = path.resolve()
-        mount = Path(str(mount_drive).rstrip("/\\") + "/").resolve()
     except (OSError, RuntimeError, ValueError) as exc:
         raise ValueError(f"无法解析本地来源: {value}") from exc
     if canonical == Path(canonical.anchor):
         raise ValueError("不能把磁盘根目录作为来源")
-    if _overlap(_path_parts(canonical), _path_parts(mount)):
-        raise ValueError("本地来源指向 PhoneNAS 挂载目录")
-    canonical_drive = ntpath.splitdrive(str(canonical))[0].casefold()
+    canonical_drive = ntpath.splitdrive(_plain_local_name(str(canonical)))[0].casefold()
     if mounted_drive and canonical_drive == mounted_drive:
         raise ValueError("本地来源指向 PhoneNAS 挂载盘")
+    mount = Path(mount_value + "/")
+    try:
+        mount = mount.resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        if not mounted_drive or not isinstance(exc, OSError):
+            raise ValueError(f"无法解析 PhoneNAS 挂载目录: {mount}") from exc
+        # An unavailable drive (e.g. WinError 1005) still reserves its letter.
+        # A directory mount needs a canonical path to check for aliases.
+    if _overlap(_path_parts(canonical), _path_parts(mount)):
+        raise ValueError("本地来源指向 PhoneNAS 挂载目录")
     return canonical
 
 
@@ -267,7 +275,7 @@ def validate_tasks(tasks: Iterable[MirrorTask], mount_drive: str = "X:") -> None
             normalized = normalize_remote_path(value)
             if value != normalized:
                 raise ValueError("远端目录必须使用规范化相对路径")
-            remote = tuple(part.casefold() for part in normalized.split("/"))
+            remote = tuple(map(portable_name_key, normalized.split("/")))
             if ".phonenas" in remote:
                 raise ValueError("远端数据和历史目录不能占用保留的 .phonenas 控制目录")
             if any(_overlap(remote, root) for root in remote_roots):

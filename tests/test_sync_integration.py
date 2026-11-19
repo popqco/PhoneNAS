@@ -48,7 +48,8 @@ class LocalMirrorIntegrationTests(unittest.TestCase):
         source = self.base / "office"
         source.mkdir()
         names = ("private-\ue000.txt", "emoji-👩\u200d💻.txt", "join-\u200c.txt", "unassigned-\u0378.txt",
-                 "symbol-␡260702.txt", "paragraph-\u2029.txt")
+                 "symbol-␡260702.txt", "paragraph-\u2029.txt", "PCB\u200b.txt", "symbol-\x7f260702.txt",
+                 "quote-\u201b.txt", "slash-\uff0f.txt")
         for name in names:
             (source / name).write_bytes(b"original bytes")
         publisher = new_task(str(source))
@@ -77,7 +78,7 @@ class LocalMirrorIntegrationTests(unittest.TestCase):
         source = self.base / "office"
         source.mkdir()
         publisher = new_task(str(source))
-        bad_name = "invisible-\u200b260702.txt"
+        bad_name = "invisible-\u202e260702.txt"
         for side in ("本地", "手机"):
             with self.subTest(side=side):
                 root = source if side == "本地" else self.remote / publisher.remote_path
@@ -89,8 +90,8 @@ class LocalMirrorIntegrationTests(unittest.TestCase):
                 message = str(caught.exception)
                 self.assertIn(side, message)
                 self.assertIn("260702.txt", message)
-                self.assertIn("U+200B", message)
-                self.assertNotIn("\u200b", message)
+                self.assertIn("U+202E", message)
+                self.assertNotIn("\u202e", message)
                 self.assertEqual(path.read_bytes(), b"must stay untouched")
                 self.assertFalse((self.remote / ".phonenas").exists())
                 self.assertFalse((self.base / "baseline").exists())
@@ -398,14 +399,16 @@ class LocalMirrorIntegrationTests(unittest.TestCase):
         published = coordinator.read()
         for phase, digest in (("publishing", published["content_digest"]), ("ready", "0" * 64)):
             with self.subTest(phase=phase):
-                coordinator.write(phase, published["generation"], content_digest=digest)
+                coordinator.write(phase, published["generation"], content_digest=digest,
+                                  protocol=published["version"])
                 recovery = self.engine(receiver, operation="recover")
                 report = recovery.preview()
                 self.assertTrue(report.blocked, report.reason)
                 with self.assertRaises(RuntimeError):
                     recovery.execute(report)
                 self.assertEqual((home / "file.txt").read_bytes(), b"AAAA")
-        coordinator.write("ready", published["generation"], content_digest=published["content_digest"])
+        coordinator.write("ready", published["generation"], content_digest=published["content_digest"],
+                          protocol=published["version"])
         recovery = self.engine(receiver, operation="recover")
         report = recovery.preview()
         self.assertFalse(report.blocked, report.reason)
