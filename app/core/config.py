@@ -5,6 +5,7 @@ import copy
 import ctypes
 import json
 import os
+import stat
 import sys
 import uuid
 from ctypes import wintypes
@@ -195,6 +196,12 @@ def _decode_config(incoming: Any) -> tuple[dict[str, Any], bool]:
     return data, migrated
 
 
+_TASK_BINDING_FIELDS = (
+    "direction", "local_path", "remote_path", "versions_path", "local_history_path",
+    "dataset_id", "excludes", "sync_identity",
+)
+
+
 class Config:
     def __init__(self, path: Path | None = None):
         self.path = Path(path) if path else data_dir() / "config.json"
@@ -227,9 +234,22 @@ class Config:
             self.data["mirror"]["enabled"] = False
 
     def save(self) -> None:
+        self._save()
+
+    def _save(self, *, backup_existing: bool = False) -> None:
         if self.load_error:
             raise ValueError(f"配置加载失败，拒绝覆盖原文件: {self.load_error}")
         payload, _ = _decode_config(self.data)
+        # A draft may predate the on-disk config, and journals can outlive it.
+        try:
+            self.path.lstat()
+        except FileNotFoundError:
+            original = None
+        else:
+            original = self.path.read_bytes()
+        self._check_pending_bindings(original, payload)
+        if backup_existing and original is not None:
+            self._backup_replaced_config(original)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if self._migration_original is not None:
             try:
@@ -245,6 +265,49 @@ class Config:
         self.data = payload
         self._migration_original = None
         self._migration_version = None
+
+    def _check_pending_bindings(self, original: bytes | None, payload: dict[str, Any]) -> None:
+        baselines = self.path.parent / "baselines"
+        try:
+            info = baselines.lstat()
+        except FileNotFoundError:
+            return
+        if (not stat.S_ISDIR(info.st_mode)
+                or getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+            raise ValueError("基线状态路径不是普通目录，拒绝覆盖原配置")
+
+        suffix = ".pending.json"
+        # An entry alone is enough: never read or follow a recovery journal.
+        pending = {name for entry in baselines.iterdir()
+                   if (name := os.path.normcase(entry.name)).endswith(suffix)}
+        if not pending:
+            return
+        unverifiable = "存在未完成操作记录，无法确认原配置的任务绑定"
+        if original is None:
+            raise ValueError(unverifiable)
+        try:
+            saved, _ = _decode_config(json.loads(original.decode("utf-8-sig")))
+        except (ValueError, TypeError, KeyError, RecursionError) as exc:
+            raise ValueError(unverifiable) from exc
+
+        saved_tasks = saved["mirror"]["tasks"]
+        saved_journal_names = {os.path.normcase(f"{task['id']}{suffix}") for task in saved_tasks}
+        if not pending.issubset(saved_journal_names):
+            raise ValueError(unverifiable)
+
+        # Compare the effective URL, just as the WebDAV client and journal do.
+        old_nas, new_nas = saved["nas"], payload["nas"]
+        connection_changed = (old_nas["url"].rstrip("/") != new_nas["url"].rstrip("/")
+                              or old_nas["username"] != new_nas["username"])
+        candidates = {task["id"]: task for task in payload["mirror"]["tasks"]}
+        for old in saved_tasks:
+            task_id = old["id"]
+            if os.path.normcase(f"{task_id}{suffix}") not in pending:
+                continue
+            new = candidates.get(task_id)
+            if (connection_changed or new is None
+                    or any(old[field] != new[field] for field in _TASK_BINDING_FIELDS)):
+                raise ValueError(f"任务 {task_id} 有未完成操作记录，请先恢复操作再更改连接、任务绑定或移除任务")
 
     @property
     def load_error(self) -> str:
@@ -397,31 +460,28 @@ class Config:
         draft.data["app"].pop("schedule_approval", None)
         draft._load_error = ""
         draft._migrated = migrated
-        # Back up the file being replaced, not the normalized in-memory config.
-        try:
-            original = self.path.read_bytes()
-        except FileNotFoundError:
-            pass
-        else:
-            stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-            suffix = 0
-            while True:
-                unique = f"-{suffix}" if suffix else ""
-                backup_path = self.path.with_name(f"{self.path.stem}.replaced-{stamp}{unique}.backup")
-                try:
-                    backup = backup_path.open("xb")
-                except FileExistsError:
-                    suffix += 1
-                    continue
-                try:
-                    with backup:
-                        backup.write(original)
-                except OSError:
-                    try:
-                        backup_path.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-                    raise
-                break
-        draft.save()
+        draft._save(backup_existing=True)
         self.apply_snapshot(draft)
+
+    def _backup_replaced_config(self, original: bytes) -> None:
+        # Back up the file being replaced, not the normalized in-memory config.
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        suffix = 0
+        while True:
+            unique = f"-{suffix}" if suffix else ""
+            backup_path = self.path.with_name(f"{self.path.stem}.replaced-{stamp}{unique}.backup")
+            try:
+                backup = backup_path.open("xb")
+            except FileExistsError:
+                suffix += 1
+                continue
+            try:
+                with backup:
+                    backup.write(original)
+            except OSError:
+                try:
+                    backup_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
+            return

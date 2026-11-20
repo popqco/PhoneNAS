@@ -53,7 +53,7 @@ class TaskIsolationTests(unittest.TestCase):
             self.assertEqual(download.direction, "download")
             self.assertEqual(download.action_text, "立即拉取")
             self.assertEqual(download.direction_label, "从手机拉取")
-            self.assertEqual(Path(download.versions_path).name, "versions")
+            self.assertEqual(download.versions_path, "PhoneNasHistory/source-" + download.id[:8])
             self.assertEqual(MirrorTask.from_dict(download.to_dict()), download)
             legacy = upload.to_dict()
             del legacy["direction"]
@@ -91,22 +91,24 @@ class TaskIsolationTests(unittest.TestCase):
                 with self.subTest(dataset_id=identity), self.assertRaises(ValueError):
                     MirrorTask.from_dict(payload)
 
-    def test_local_history_defaults_to_absolute_sibling_for_new_and_legacy_construction(self) -> None:
+    def test_local_history_is_grouped_for_new_tasks_and_legacy_paths_are_preserved(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             local = Path(tmp) / "work"
             for direction in ("upload", "download"):
                 task = new_task(str(local), direction=direction)
-                expected = local.with_name(f"work.PhoneNAS-history-{task.id[:8]}")
+                expected = local.parent / "PhoneNAS-本地历史" / f"work-{task.id[:8]}"
                 self.assertEqual(Path(task.local_history_path), expected)
                 self.assertTrue(Path(task.local_history_path).is_absolute())
-                self.assertFalse(expected.exists())
+                self.assertFalse(expected.parent.exists())
                 self.assertEqual(task.history_location,
                                  task.versions_path if direction == "upload" else str(expected))
+                self.assertEqual(MirrorTask.from_dict(task.to_dict()), task)
                 legacy = task.to_dict()
                 del legacy["local_history_path"]
-                self.assertEqual(MirrorTask.from_dict(legacy).local_history_path, str(expected))
+                old_default = str(local.with_name(f"work.PhoneNAS-history-{task.id[:8]}"))
+                self.assertEqual(MirrorTask.from_dict(legacy).local_history_path, old_default)
                 direct = MirrorTask(**{key: value for key, value in legacy.items() if key != "dataset_id"})
-                self.assertEqual(direct.local_history_path, str(expected))
+                self.assertEqual(direct.local_history_path, old_default)
                 validate_tasks([task])
             draft = new_task("")
             self.assertEqual(draft.local_history_path, "")
@@ -205,10 +207,9 @@ class TaskIsolationTests(unittest.TestCase):
             self.assertEqual(validate_source(first), left.resolve())
             self.assertNotEqual(first.id, second.id)
             self.assertNotEqual(first.remote_path, second.remote_path)
-            self.assertTrue(first.remote_path.startswith("backup/"))
-            self.assertEqual(Path(first.remote_path).name, "mirror")
-            self.assertEqual(Path(first.versions_path).name, "versions")
-            self.assertEqual(Path(first.remote_path).parent, Path(first.versions_path).parent)
+            self.assertEqual(first.remote_path, f"PhoneNasBackup/设计文件 - v2-{first.id[:8]}")
+            self.assertEqual(first.versions_path, f"PhoneNasHistory/设计文件 - v2-{first.id[:8]}")
+            self.assertEqual(Path(second.remote_path).name, f"设计文件 - v2-{second.id[:8]}")
             self.assertEqual(normalize_remote_path(" backup\\docs//mirror/ "), "backup/docs/mirror")
             self.assertEqual(replace(first, name="改名").remote_path, first.remote_path)
             with self.assertRaises(FrozenInstanceError):
@@ -236,7 +237,7 @@ class TaskIsolationTests(unittest.TestCase):
                     validate_tasks([first, replace(second, local_path=local)])
             for mirror, versions in ((first.remote_path, second.versions_path),
                                      (first.remote_path + "/child", second.versions_path),
-                                     (second.remote_path, "backup"),
+                                     (second.remote_path, "PhoneNasBackup"),
                                      (first.versions_path + "/old", second.versions_path),
                                      (second.remote_path, second.remote_path)):
                 with self.subTest(mirror=mirror, versions=versions), self.assertRaises(ValueError):

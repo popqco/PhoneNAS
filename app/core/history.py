@@ -17,6 +17,7 @@ from app.core.filenames import (
 )
 from app.core.retention import parse_version_name
 from app.core.tasks import MirrorTask
+from app.core.winpath import filesystem_path
 
 
 def _version_name(name: str) -> str:
@@ -64,6 +65,7 @@ def validate_history_inventory(
 
 def _no_links(path: Path) -> None:
     """Inspect lexical ancestors before resolve can hide a symlink/junction."""
+    path = filesystem_path(path)
     for ancestor in reversed((path, *path.parents)):
         try:
             info = ancestor.lstat()
@@ -93,21 +95,28 @@ class HistoryService:
         self._lease_factory = lease_factory
 
     @contextmanager
-    def _history_lease(self):
-        from app.core.relay import DatasetCoordinator
+    def _history_lease(self, *, require_published: bool = False):
+        from app.core.relay import DatasetCoordinator, verify_remote_scope
 
         if self.protocol is not None:
-            # SyncEngine provides the checked protocol while holding its lease.
+            # SyncEngine already holds the appropriate leases and checked scope.
             yield
             return
         coordinator = DatasetCoordinator(self.rclone, self.task, lease_factory=self._lease_factory)
         if coordinator.locked():
             raise RuntimeError("数据集有其他操作或未完成发布；不会接管其锁或修改历史文件。")
-        with coordinator.lease():
-            state = coordinator.read()
-            if state is not None and state["phase"] != "ready":
-                raise RuntimeError("数据集有未完成发布；不能恢复或删除手机历史。")
-            yield
+        if require_published:
+            verify_remote_scope(self.rclone, self.task, require_ready=True)
+        with coordinator.lease() as lease:
+            if require_published:
+                with coordinator.registration_lease(lease):
+                    verify_remote_scope(self.rclone, self.task, require_ready=True)
+                    yield
+            else:
+                state = coordinator.read()
+                if state is not None and state["phase"] != "ready":
+                    raise RuntimeError("数据集有未完成发布；不能恢复手机历史。")
+                yield
 
     def _require_batch_names(self, paths: list[str]) -> None:
         from app.core.relay import DatasetCoordinator
@@ -200,9 +209,10 @@ class HistoryService:
             if not _within(target.resolve(strict=True), destination):
                 raise ValueError("恢复目录超出所选目录")
             for relative in selected:
-                output = target.joinpath(*relative_parts(relative))
+                output_display = target.joinpath(*relative_parts(relative))
+                output = filesystem_path(output_display)
                 _no_links(output)
-                if not _within(output.resolve(), target.resolve(strict=True)):
+                if not _within(output_display, target):
                     raise ValueError("恢复文件超出专用恢复目录")
                 output.parent.mkdir(parents=True, exist_ok=True)
                 _no_links(output)
@@ -211,7 +221,7 @@ class HistoryService:
                 with output.open("xb"):
                     pass
                 result = self.rclone.copyto(
-                    f"{C.DEFAULT_REMOTE}:{self.task.versions_path}/{version}/{relative}", str(output),
+                    f"{C.DEFAULT_REMOTE}:{self.task.versions_path}/{version}/{relative}", str(output_display),
                 )
                 if not result.ok:
                     raise RuntimeError(result.err or result.out or f"退出码 {result.code}")
@@ -228,7 +238,7 @@ class HistoryService:
         if version not in self.list_versions():
             raise ValueError("该历史批次已不在当前任务的远端列表中；请刷新后重试")
         self.list_files(version)
-        with self._history_lease():
+        with self._history_lease(require_published=True):
             # Recheck the whole batch, including empty directories, under the
             # shared lock. A timestamp alone is not authority to purge it.
             if self.protocol is None:
@@ -251,6 +261,19 @@ def _absolute_local_path(value: str | os.PathLike[str]) -> Path:
     relative_parts("/".join(path.parts[1:]))
     _no_links(path)
     return path.resolve()
+
+
+def validate_local_history_path(value: str) -> Path:
+    """A history root may be absent, but it cannot be a file or under one."""
+    path = _absolute_local_path(value)
+    for ancestor in reversed((path, *path.parents)):
+        try:
+            mode = filesystem_path(ancestor).stat().st_mode
+        except FileNotFoundError:
+            break
+        if not stat.S_ISDIR(mode):
+            raise ValueError(f"本地历史目录（或其上级）是文件，不是文件夹：{ancestor}")
+    return path
 
 
 def _local_overlap(left: Path, right: Path) -> bool:
@@ -279,7 +302,7 @@ class LocalHistoryService:
             _no_links(self.root)
             _no_links(self.local)
             try:
-                entries = list(self.root.iterdir())
+                entries = list(filesystem_path(self.root).iterdir())
             except FileNotFoundError:
                 return []
             names = []
@@ -289,7 +312,7 @@ class LocalHistoryService:
                 except ValueError:
                     continue
                 _no_links(entry)
-                if stat.S_ISDIR(entry.lstat().st_mode):
+                if stat.S_ISDIR(filesystem_path(entry).lstat().st_mode):
                     names.append(name)
             return sorted(names, reverse=True)
         except OSError as exc:
@@ -298,25 +321,26 @@ class LocalHistoryService:
     def _inventory(self, version: str) -> tuple[list[str], list[str]]:
         version = _version_name(version)
         batch = self.root / version
+        batch_fs = filesystem_path(batch)
         try:
             _no_links(self.root)
             _no_links(self.local)
             _no_links(batch)
-            if not stat.S_ISDIR(batch.lstat().st_mode):
+            if not stat.S_ISDIR(batch_fs.lstat().st_mode):
                 raise ValueError("该历史批次不是普通目录")
             paths, directories = [], []
-            pending = [batch]
+            pending = [(batch_fs, "")]
             while pending:
-                directory = pending.pop()
+                directory, prefix = pending.pop()
                 _no_links(directory)
                 for entry in directory.iterdir():
-                    relative = entry.relative_to(batch).as_posix()
+                    relative = f"{prefix}/{entry.name}" if prefix else entry.name
                     relative_parts(relative)
                     _no_links(entry)
-                    info = entry.lstat()
+                    info = filesystem_path(entry).lstat()
                     if stat.S_ISDIR(info.st_mode):
                         directories.append(relative)
-                        pending.append(entry)
+                        pending.append((filesystem_path(entry), relative))
                     elif stat.S_ISREG(info.st_mode):
                         paths.append(relative)
                     else:
@@ -355,8 +379,8 @@ class LocalHistoryService:
         restored = 0
         try:
             for relative in selected:
-                source = self.root / version / relative
-                output = target.joinpath(*relative_parts(relative))
+                source = filesystem_path(self.root / version / relative)
+                output = filesystem_path(target.joinpath(*relative_parts(relative)))
                 _no_links(source)
                 info = source.lstat()
                 if not stat.S_ISREG(info.st_mode):
@@ -392,19 +416,19 @@ class LocalHistoryService:
             # Never hand a tree to rmtree: only unlink the validated inventory,
             # and inspect each entry and every ancestor again before mutation.
             for relative in files:
-                path = batch.joinpath(*relative_parts(relative))
+                path = filesystem_path(batch.joinpath(*relative_parts(relative)))
                 _no_links(path)
                 if not stat.S_ISREG(path.lstat().st_mode):
                     raise ValueError("本地历史文件已改变；请刷新后重试")
                 path.unlink()
             for relative in sorted(directories, key=lambda item: len(item.split("/")), reverse=True):
-                path = batch.joinpath(*relative_parts(relative))
+                path = filesystem_path(batch.joinpath(*relative_parts(relative)))
                 _no_links(path)
                 if not stat.S_ISDIR(path.lstat().st_mode):
                     raise ValueError("本地历史目录已改变；请刷新后重试")
                 path.rmdir()
             _no_links(batch)
-            batch.rmdir()
+            filesystem_path(batch).rmdir()
         except Exception as exc:
             raise RuntimeError(
                 f"永久删除未确认完成，本地历史可能已部分删除；请刷新检查 {batch}：{exc}"

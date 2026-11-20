@@ -7,6 +7,7 @@ import os
 import re
 import stat
 import tempfile
+import time
 import uuid
 import urllib.error
 import urllib.parse
@@ -20,7 +21,8 @@ from typing import Mapping
 from app import constants as C
 from app.core.filenames import LEGACY, LITERAL, portable_name_key, require_legacy_paths, require_legacy_rules
 from app.core.history import validate_history_inventory
-from app.core.tasks import MirrorTask
+from app.core.tasks import MirrorTask, dataset_id_for_remote, normalize_remote_path
+from app.core.winpath import filesystem_path
 
 
 @dataclass(frozen=True)
@@ -123,6 +125,7 @@ def _json(text: str, limit: int = _MAX_METADATA):
 
 
 def _no_links(path: Path) -> None:
+    path = filesystem_path(path)
     for ancestor in reversed((path, *path.parents)):
         try:
             info = ancestor.lstat()
@@ -133,6 +136,7 @@ def _no_links(path: Path) -> None:
 
 
 def _inspect_local_tree(path: Path, cancelled) -> None:
+    path = filesystem_path(path)
     _no_links(path)
     try:
         if not path.exists():
@@ -153,7 +157,7 @@ def _inspect_local_tree(path: Path, cancelled) -> None:
                     if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
                         raise ValueError("目录树包含符号链接、junction 或重解析点")
                     if stat.S_ISDIR(info.st_mode):
-                        pending.append(Path(entry.path))
+                        pending.append(filesystem_path(Path(entry.path)))
                     elif not stat.S_ISREG(info.st_mode):
                         raise ValueError("目录树包含非普通文件")
     except OSError as exc:
@@ -379,7 +383,10 @@ class BaselineStore:
                 raise ValueError("基线校验失败")
         except (ValueError, TypeError, KeyError) as exc:
             raise RuntimeError("本地基线已损坏") from exc
-        if binding != self.binding:
+        # Local archive routing affects recovery, not the identity of the
+        # shared working copy. Keep the field on disk for older readers and
+        # keep comparing it exactly in PendingOperation.
+        if any(binding[key] != expected for key, expected in self.binding.items() if key != "local_history_path"):
             return None
         if protocol is not None and payload["version"] != protocol:
             raise RuntimeError("本地基线与手机数据集的文件名协议不同；请保留两端文件和原有状态，不会自动转换。")
@@ -400,6 +407,23 @@ _CONTROL_LIMIT = 64 * 1024
 _PHASES = {"ready", "publishing", "interrupted"}
 
 
+def _validate_dataset_state(value: dict, scope: dict) -> dict:
+    required = {"version", *scope, "generation", "phase"}
+    if (type(value) is not dict or not required.issubset(value)
+            or set(value) - required - {"content_digest", "writer_identity"}
+            or type(value["version"]) is not int or value["version"] not in (LEGACY, LITERAL)
+            or any(type(value[key]) is not type(expected) or value[key] != expected for key, expected in scope.items())
+            or type(value["phase"]) is not str or value["phase"] not in _PHASES):
+        raise ValueError("数据集状态与任务目录、身份或排除规则不一致")
+    _uuid(value["generation"])
+    if "writer_identity" in value:
+        _uuid(value["writer_identity"])
+    digest = value.get("content_digest", "")
+    if type(digest) is not str or (digest and not re.fullmatch(r"[0-9a-f]{64}", digest)):
+        raise ValueError("数据集内容校验值无效")
+    return value
+
+
 class DatasetCoordinator:
     """Dataset-scoped metadata and a shared exclusive lease for readers/writers."""
 
@@ -412,21 +436,7 @@ class DatasetCoordinator:
         self._lease_factory = lease_factory
 
     def _state(self, value: dict) -> dict:
-        required = {"version", *self.scope, "generation", "phase"}
-        if (type(value) is not dict or not required.issubset(value)
-                or set(value) - required - {"content_digest", "writer_identity"}
-                or type(value["version"]) is not int or value["version"] not in (LEGACY, LITERAL)
-                or any(type(value[key]) is not type(expected) or value[key] != expected
-                       for key, expected in self.scope.items())
-                or type(value["phase"]) is not str or value["phase"] not in _PHASES):
-            raise ValueError("数据集状态与任务目录、身份或排除规则不一致")
-        _uuid(value["generation"])
-        if "writer_identity" in value:
-            _uuid(value["writer_identity"])
-        digest = value.get("content_digest", "")
-        if type(digest) is not str or (digest and not re.fullmatch(r"[0-9a-f]{64}", digest)):
-            raise ValueError("数据集内容校验值无效")
-        return value
+        return _validate_dataset_state(value, self.scope)
 
     def read(self) -> dict | None:
         result = self.rclone.run(["cat", f"{self.control}/state.json", "--head",
@@ -473,6 +483,12 @@ class DatasetCoordinator:
             yield lease
 
     @contextmanager
+    def registration_lease(self, dataset_lease):
+        """Serialize first registrations and purges across dataset IDs."""
+        with dataset_lease.for_registration():
+            yield
+
+    @contextmanager
     def recovery_lease(self, expected_token: str):
         """Explicit recovery only, under the caller's job gate and approved journal.
 
@@ -481,6 +497,152 @@ class DatasetCoordinator:
         """
         with self._new_lease().recover(expected_token) as lease:
             yield lease
+
+
+_DATASET_SCAN_LIMIT = 64
+_DATASET_LIST_LIMIT = 64 * 1024
+_DATASET_SCAN_TIMEOUT = 35
+_DATASET_PATH_LIMIT = 4096  # Same bound as the file inventory.
+
+
+def _registered_root(path: str) -> tuple[str, ...]:
+    if type(path) is not str or len(path) > _DATASET_PATH_LIMIT:
+        raise ValueError("远端目录无效或过长")
+    if normalize_remote_path(path) != path:
+        raise ValueError("必须使用原样的规范化远端目录")
+    key = tuple(map(portable_name_key, path.split("/")))
+    if ".phonenas" in key:
+        raise ValueError("远端目录不能占用保留的 .phonenas 控制目录")
+    return key
+
+
+class _DatasetRegistry:
+    """Bounded, read-only access to exact remote registrations."""
+
+    control = f"{C.DEFAULT_REMOTE}:.phonenas/datasets"
+    listing_flags = ("--no-modtime", "--no-mimetype")
+
+    def __init__(self, rclone, cancelled=None):
+        self.rclone = rclone
+        self.cancelled = cancelled
+        probe = _CancelProbe(cancelled) if callable(cancelled) else cancelled
+        self.options = {"cancel_event": probe} if probe is not None else {}
+        self.deadline = time.monotonic() + _DATASET_SCAN_TIMEOUT
+
+    def _read(self, args: list[str], *, missing_ok=True) -> str | None:
+        _check_cancel(self.cancelled)
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("核对手机数据集登记超时")
+        result = self.rclone.run([*args, "--retries", "1", "--low-level-retries", "1"],
+                                 timeout=max(1, min(20, int(remaining))), **self.options)
+        _check_cancel(self.cancelled)
+        if not result.ok:
+            if missing_ok and result.code in (3, 4):
+                return None
+            raise RuntimeError(f"读取手机数据集失败：{result.err or result.out or result.code}")
+        return result.out
+
+    def state(self, dataset_id: str) -> dict | None:
+        path = f"{self.control}/{dataset_id}/state.json"
+        raw = self._read(["lsjson", path, "--stat", *self.listing_flags])
+        if raw is None:
+            return None
+        info = _json(raw, _CONTROL_LIMIT)
+        # cat also accepts directories. Check the exact file first, then enforce
+        # the byte limit again during transfer (in case the file has grown).
+        if (type(info) is not dict or info.get("IsDir") is not False
+                or info.get("Path") != "state.json" or info.get("Name", "state.json") != "state.json"
+                or type(info.get("Size")) is not int or not 0 <= info["Size"] <= _CONTROL_LIMIT):
+            raise RuntimeError("数据集状态文件无效或超过安全大小限制")
+        raw = self._read(["cat", path, "--head", str(_CONTROL_LIMIT + 1), "--max-depth", "1",
+                          "--max-transfer", f"{_CONTROL_LIMIT}B", "--cutoff-mode", "HARD"], missing_ok=False)
+        value = _json(raw, _CONTROL_LIMIT)
+        try:
+            if type(value) is not dict or type(value.get("excludes")) is not list:
+                raise ValueError("无效的状态或排除规则")
+            _registered_root(value.get("remote_path"))
+            _registered_root(value.get("versions_path"))
+            task = MirrorTask(id="dataset-lookup", name="", enabled=False, local_path="",
+                              remote_path=value["remote_path"], versions_path=value["versions_path"],
+                              interval_minutes=C.DEFAULT_INTERVAL_MINUTES,
+                              retention_days=C.DEFAULT_RETENTION_DAYS, exclude_preset="custom",
+                              excludes=tuple(value["excludes"]), dataset_id=dataset_id)
+            return _validate_dataset_state(value, _task_scope(task))
+        except (ValueError, TypeError, KeyError) as exc:
+            raise RuntimeError("数据集状态损坏或与控制目录不匹配") from exc
+
+    def ids(self) -> set[str]:
+        raw = self._read(["lsjson", self.control, "--dirs-only", "--max-depth", "1", *self.listing_flags])
+        if raw is None:
+            return set()
+        listing = _json(raw, _DATASET_LIST_LIMIT)
+        if type(listing) is not list or len(listing) > _DATASET_SCAN_LIMIT:
+            raise RuntimeError("数据集目录列表无效或超过安全数量限制")
+        ids = set()
+        for entry in listing:
+            _check_cancel(self.cancelled)
+            if type(entry) is not dict or type(entry.get("IsDir")) is not bool:
+                raise RuntimeError("数据集目录列表包含无效项")
+            name = entry.get("Path")
+            if not entry["IsDir"]:
+                continue
+            if type(name) is not str or not re.fullmatch(r"[0-9a-f]{32}", name) or entry.get("Name", name) != name:
+                raise RuntimeError("数据集控制目录包含未知或不安全的登记项")
+            if name in ids:
+                raise RuntimeError("数据集控制目录存在重复目录项")
+            ids.add(name)
+        return ids
+
+
+def find_published_dataset(rclone, mirror: str, *, cancelled=None) -> dict | None:
+    """Return a unique, exact ready record. Never guess an ambiguous binding."""
+    _check_cancel(cancelled)
+    mirror_key = _registered_root(mirror)
+    registry = _DatasetRegistry(rclone, cancelled)
+    canonical_id = dataset_id_for_remote(mirror)
+    match = registry.state(canonical_id)
+    if match is not None and match["remote_path"] != mirror:
+        raise RuntimeError("数据集镜像目录的精确名称不匹配")
+    for dataset_id in sorted(registry.ids() - {canonical_id}):
+        record = registry.state(dataset_id)
+        if record is None or _registered_root(record["remote_path"]) != mirror_key:
+            continue
+        if match is not None:
+            raise RuntimeError("该镜像关联多个数据集，无法安全选择")
+        match = record
+    if match is not None:
+        if match["remote_path"] != mirror:
+            raise RuntimeError("数据集镜像目录的精确名称不匹配")
+        if match["phase"] != "ready" or not match.get("content_digest"):
+            raise RuntimeError("数据集尚未准备就绪或缺少内容校验值")
+    _check_cancel(cancelled)
+    return match
+
+
+def verify_remote_scope(rclone, task: MirrorTask, *, require_ready=False, cancelled=None) -> None:
+    """Reject overlaps with any other visible registered mirror or archive."""
+    registry = _DatasetRegistry(rclone, cancelled)
+    expected = _task_scope(task)
+    paths = tuple(_registered_root(expected[key]) for key in ("remote_path", "versions_path"))
+    ids = registry.ids()
+    if require_ready:
+        state = registry.state(task.dataset_id)
+        if state is not None and state["phase"] != "ready":
+            raise RuntimeError("数据集有未完成发布；不能永久删除手机历史。")
+        if state is None or not state.get("content_digest"):
+            raise RuntimeError("手机历史目录没有已发布的可核实归属，拒绝永久删除。")
+        if any(state[key] != value for key, value in expected.items()):
+            raise RuntimeError("手机历史目录的发布记录与任务不匹配，拒绝永久删除。")
+    for dataset_id in sorted(ids - {task.dataset_id}):
+        record = registry.state(dataset_id)
+        if record is None:
+            continue
+        for key in ("remote_path", "versions_path"):
+            other = _registered_root(record[key])
+            if any(path[:min(len(path), len(other))] == other[:min(len(path), len(other))] for path in paths):
+                raise RuntimeError("手机镜像或历史目录已与另一个数据集重叠；请使用独立目录。")
+    _check_cancel(cancelled)
 
 
 def _owner(task: MirrorTask, token: str) -> dict:
@@ -498,6 +660,11 @@ class LocalDatasetLease:
         self.token = uuid.uuid4().hex
         self._held = False
         self._retained = False
+
+    def for_registration(self):
+        lease = LocalDatasetLease(self.path.parents[2], self.task)
+        lease.path = self.path.parent / "directory-registration"
+        return lease
 
     def __enter__(self):
         if self._held:
@@ -602,6 +769,11 @@ class _WebDAVDatasetLease:
         self.authorization = "Basic " + base64.b64encode(credentials).decode("ascii")
         # Ignore proxy environment and refuse every redirect, including same-host.
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+
+    def for_registration(self):
+        lease = _WebDAVDatasetLease(self.rclone, self.task)
+        lease.url = lease.url.rstrip("/").rsplit("/", 1)[0] + "/directory-registration/"
+        return lease
 
     def _request(self, method: str, url: str, data: bytes | None = None) -> tuple[int, bytes]:
         headers = {"Authorization": self.authorization}

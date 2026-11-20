@@ -42,8 +42,7 @@ class MirrorTask:
         if type(self.direction) is not str or self.direction not in ("upload", "download"):
             raise ValueError("任务 direction 必须是 upload 或 download")
         if self.dataset_id == "":
-            remote = normalize_remote_path(self.remote_path).casefold()
-            dataset_id = uuid.uuid5(uuid.NAMESPACE_URL, "phonenas-dataset:" + remote).hex
+            dataset_id = dataset_id_for_remote(self.remote_path)
         else:
             dataset_id = _normalize_uuid(self.dataset_id, "dataset_id")
         object.__setattr__(self, "dataset_id", dataset_id)
@@ -135,13 +134,11 @@ def new_task(
     if type(local_path) is not str or type(name) is not str:
         raise ValueError("本地路径和任务名称必须是字符串")
     task_id = uuid.uuid4().hex
-    label = name.strip() or Path(local_path).name or "文件夹"
-    slug = re.sub(r"[^a-z0-9]+", "-", label.casefold()).strip("-")[:48] or "folder"
-    root = f"backup/{slug}-{task_id[:8]}"
-    remote = normalize_remote_path(remote_path if remote_path is not None else f"{root}/mirror")
+    label = name.strip() or ntpath.basename(local_path.rstrip("/\\")) or "文件夹"
+    suggested_mirror, suggested_history = suggest_phone_paths(label, task_id)
+    remote = normalize_remote_path(suggested_mirror if remote_path is None else remote_path)
     if versions_path is None:
-        parent, _, leaf = remote.rpartition("/")
-        versions_path = f"{parent}/versions" if parent and leaf.casefold() == "mirror" else f"{remote}-versions"
+        versions_path = suggested_history if remote_path is None else suggest_phone_history(remote)
     versions = normalize_remote_path(versions_path)
     return MirrorTask(
         id=task_id,
@@ -156,8 +153,49 @@ def new_task(
         excludes=tuple(C.RECOMMENDED_EXCLUDES),
         direction=direction,
         dataset_id="" if dataset_id is None else dataset_id,
+        local_history_path=suggest_local_history(local_path, task_id),
         sync_identity=uuid.uuid4().hex,
     )
+
+
+def task_folder_name(name: str, task_id: str) -> str:
+    # Keep readable letters (including Chinese), but never let a display name
+    # become a path component without checking it.
+    stem = re.sub(r'[\\/<>:"|?*]+', "-", name)
+    stem = " ".join(stem.split())[:48].rstrip(" .-") or "文件夹"
+    candidate = f"{stem}-{task_id[:8]}"
+    try:
+        relative_parts(candidate)
+    except ValueError:
+        candidate = f"文件夹-{task_id[:8]}"
+    return candidate
+
+
+def suggest_phone_paths(name: str, task_id: str) -> tuple[str, str]:
+    folder = task_folder_name(name, task_id)
+    return f"PhoneNasBackup/{folder}", f"PhoneNasHistory/{folder}"
+
+
+def suggest_phone_history(remote: str) -> str:
+    parent, _, leaf = remote.rpartition("/")
+    if portable_name_key(parent) == "phonenasbackup":
+        return f"PhoneNasHistory/{leaf}"
+    # Keep the previous convention for explicitly chosen old-style mirrors.
+    if parent and leaf.casefold() == "mirror":
+        return f"{parent}/versions"
+    return f"{remote}-versions"
+
+
+def suggest_local_history(local_path: str, task_id: str) -> str:
+    if not local_path.strip():
+        return ""
+    local = Path(_plain_local_name(local_path))
+    if not local.is_absolute() or not local.name:
+        return ""
+    group = "PhoneNAS-本地历史"
+    if portable_name_key(local.name) == portable_name_key(group):
+        group += "-归档"
+    return str(local.parent / group / task_folder_name(local.name, task_id))
 
 
 def normalize_remote_path(path: str) -> str:
@@ -171,6 +209,10 @@ def normalize_remote_path(path: str) -> str:
     if not parts or any(part in (".", "..") or part != part.strip() or part.endswith(".") for part in parts):
         raise ValueError("远端目录不能包含空白或 . / .. 路径段")
     return "/".join(relative_parts("/".join(parts)))
+
+
+def dataset_id_for_remote(path: str) -> str:
+    return uuid.uuid5(uuid.NAMESPACE_URL, "phonenas-dataset:" + normalize_remote_path(path).casefold()).hex
 
 
 def _plain_local_name(value: str) -> str:

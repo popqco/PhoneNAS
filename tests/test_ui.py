@@ -557,6 +557,33 @@ class DesktopRegressionTests(unittest.TestCase):
             QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
             self.app.processEvents()
 
+    def test_setup_replaces_a_stale_mount_before_using_the_new_endpoint(self):
+        self.config.set("mount.enabled", True)
+        self.config.set("mount.auto_mount", False)
+        self.config.set("nas.url", "http://previous.invalid/dav")
+        seen = []
+        with (patch("app.ui.main_window.WizardDialog") as wizard,
+              patch("app.ui.main_window.set_autostart"),
+              patch("app.ui.main_window.MountSupervisor.start") as start):
+            window = MainWindow(self.config, first_run=True)
+            QTest.qWait(420)  # Let the startup callback pass with auto mount disabled.
+            window.mount._state = "mounted"
+
+            def finish_setup():
+                self.config.set("mount.auto_mount", True)
+                self.config.set("nas.url", "http://current.invalid/dav")
+                return 1
+
+            wizard.return_value.exec.side_effect = finish_setup
+            start.side_effect = lambda: seen.append((window.mount.state, self.config.url))
+            window.open_wizard()
+            self.assertEqual(window.mount.state, "stopped")
+            QTest.qWait(400)
+            self.assertEqual(seen, [("stopped", "http://current.invalid/dav")])
+            window.quit_app()
+            window.deleteLater()
+            self.app.processEvents()
+
     def test_overview_and_tray_sync_all_require_each_task_to_confirm_a_fresh_digest(self):
         download = replace(new_task(str(self.base / "receive"), direction="download"), auto_sync=False)
         disabled = replace(new_task(str(self.base / "disabled")), enabled=False)

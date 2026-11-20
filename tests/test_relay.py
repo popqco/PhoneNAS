@@ -14,7 +14,8 @@ from unittest.mock import patch
 from app.core.config import Config
 from app.core.rclone import Rclone, Result, rclone_exe
 from app.core.relay import (BaselineStore, ContentSnapshot, DatasetCoordinator,
-                            FileContent, LocalDatasetLease, snapshot_tree)
+                            FileContent, LocalDatasetLease, find_published_dataset,
+                            snapshot_tree)
 from app.core.tasks import new_task
 
 
@@ -266,9 +267,10 @@ class BaselineTests(IsolatedTest):
         self.assertEqual(store.load(), (snapshot, generation))
         self.assertEqual(list(state.iterdir()), [state / f"{task.id}.json"])
         original = (state / f"{task.id}.json").read_bytes()
+        rearchived = replace(task, local_history_path=str(self.root / "new-history"))
+        self.assertEqual(BaselineStore(state, rearchived, config).load(), (snapshot, generation))
         changes = {"remote_path": "other/mirror", "versions_path": "other/history",
                    "local_path": str(self.root / "other"),
-                   "local_history_path": str(self.root / "new-history"),
                    "dataset_id": "fedcba9876543210fedcba9876543210",
                    "sync_identity": "0123456789abcdef0123456789abcdef",
                    "excludes": ("*.tmp",), "direction": "download"}
@@ -312,6 +314,212 @@ class BaselineTests(IsolatedTest):
             with self.assertRaises((RuntimeError, ValueError)):
                 store.save(ContentSnapshot({}), generation)
         self.assertEqual(json.loads(path.read_text(encoding="utf-8")), original)
+
+
+class PublishedDatasetTests(IsolatedTest):
+    def setUp(self):
+        super().setUp()
+        self.task = replace(new_task(str(self.root / "source"), remote_path="Backup/Café",
+                                     versions_path="History/保存"), excludes=("z/**", "*.tmp", "a/**"))
+        self.state = {"version": 2, "dataset_id": self.task.dataset_id,
+                      "remote_path": self.task.remote_path, "versions_path": self.task.versions_path,
+                      "excludes": list(self.task.excludes), "phase": "ready",
+                      "generation": "3d096a03-4ea0-4160-8eeb-bc2ee7425b15",
+                      "content_digest": HELLO, "writer_identity": self.task.sync_identity}
+
+    @staticmethod
+    def _record(state):
+        raw = json.dumps(state)
+        stat = {"Name": "state.json", "Path": "state.json", "IsDir": False,
+                "Size": len(raw.encode("utf-8"))}
+        return Result(True, json.dumps(stat), "", 0), Result(True, raw, "", 0)
+
+    @staticmethod
+    def _listing(*entries):
+        return Result(True, json.dumps(entries), "", 0)
+
+    def test_canonical_record_is_read_exactly_and_not_preferred_over_another_owner(self):
+        for version in (1, 2):
+            with self.subTest(version=version):
+                state = {**self.state, "version": version}
+                listing = self._listing({"Path": self.task.dataset_id, "IsDir": True})
+                client = ScriptedRclone(*self._record(state), listing)
+                self.assertEqual(find_published_dataset(client, self.task.remote_path), state)
+                stat, cat, _ = client.calls
+                target = f"phone:{self.task.dataset_control_path}/state.json"
+                self.assertEqual(stat[:2], ["lsjson", target])
+                self.assertIn("--stat", stat)
+                self.assertEqual(cat[:2], ["cat", target])
+                self.assertEqual(cat[cat.index("--head") + 1], "65537")
+        other = {**self.state, "dataset_id": "f" * 32}
+        listing = self._listing({"Path": other["dataset_id"], "IsDir": True})
+        client = ScriptedRclone(*self._record(self.state), listing, *self._record(other))
+        with self.assertRaisesRegex(RuntimeError, "多个数据集"):
+            find_published_dataset(client, self.task.remote_path)
+
+    def test_missing_canonical_record_scans_only_sorted_exact_uuid_directories(self):
+        first, match, last = (char * 32 for char in "abc")
+        unrelated = {**self.state, "dataset_id": first, "remote_path": "elsewhere/mirror"}
+        explicit = {**self.state, "dataset_id": match}
+        for code in (3, 4):
+            with self.subTest(code=code):
+                missing = Result(False, "", "missing", code)
+                listing = self._listing(
+                    {"Path": last, "IsDir": True},
+                    {"Path": match, "Name": match, "IsDir": True},
+                    {"Path": "e" * 32, "IsDir": False},
+                    {"Path": self.task.dataset_id, "IsDir": True},
+                    {"Path": first, "IsDir": True},
+                )
+                client = ScriptedRclone(missing, listing, *self._record(unrelated),
+                                         *self._record(explicit), missing)
+                self.assertEqual(find_published_dataset(client, self.task.remote_path), explicit)
+                root = "phone:.phonenas/datasets"
+                self.assertEqual([call[:2] for call in client.calls], [
+                    ["lsjson", f"{root}/{self.task.dataset_id}/state.json"],
+                    ["lsjson", root],
+                    ["lsjson", f"{root}/{first}/state.json"],
+                    ["cat", f"{root}/{first}/state.json"],
+                    ["lsjson", f"{root}/{match}/state.json"],
+                    ["cat", f"{root}/{match}/state.json"],
+                    ["lsjson", f"{root}/{last}/state.json"],
+                ])
+                self.assertIn("--dirs-only", client.calls[1])
+                self.assertNotIn("--recursive", client.calls[1])
+                self.assertEqual(client.calls[1][client.calls[1].index("--max-depth") + 1], "1")
+
+    def test_input_must_be_exact_normalized_nonreserved_mirror(self):
+        for invalid in (None, "", "/", " Backup/Café", "Backup/Café/", "Backup//Café",
+                        "Backup\\Café", "phone:Backup/Café", "Backup/../mirror", "Backup/CON",
+                        ".PHONENAS/datasets", "Backup/.PhoneNAS/mirror"):
+            with self.subTest(invalid=invalid):
+                client = ScriptedRclone()
+                with self.assertRaises(ValueError):
+                    find_published_dataset(client, invalid)
+                self.assertEqual(client.calls, [])
+
+    def test_present_canonical_state_must_be_exact_ready_and_well_formed(self):
+        for change in ({"remote_path": "backup/Café"}, {"remote_path": "Backup/Cafe\u0301"},
+                       {"remote_path": "Other/mirror"}, {"versions_path": "History//保存"},
+                       {"versions_path": "History/.PhoneNAS/保存"}, {"versions_path": "Backup"},
+                       {"versions_path": "backup/Other"}, {"excludes": "*.tmp"},
+                       {"excludes": ["a", "bad\nrule"]}, {"excludes": [3]}, {"excludes": [""]},
+                       {"dataset_id": self.task.dataset_id.upper()}, {"dataset_id": "bad"},
+                       {"dataset_id": "a" * 32}, {"generation": "bad"}, {"writer_identity": "bad"},
+                       {"version": True}, {"version": 3}, {"phase": "publishing"},
+                       {"phase": "interrupted"}, {"phase": "unknown"}, {"content_digest": ""},
+                       {"content_digest": HELLO.upper()}, {"content_digest": "abcdef"}, {"extra": 1}):
+            with self.subTest(change=change):
+                client = ScriptedRclone(*self._record({**self.state, **change}), self._listing())
+                with self.assertRaises(RuntimeError):
+                    find_published_dataset(client, self.task.remote_path)
+                self.assertEqual([call[0] for call in client.calls[:2]], ["lsjson", "cat"])
+
+        for payload in (None, {key: value for key, value in self.state.items() if key != "content_digest"}):
+            with self.subTest(payload=payload):
+                client = ScriptedRclone(*self._record(payload), self._listing())
+                with self.assertRaises(RuntimeError):
+                    find_published_dataset(client, self.task.remote_path)
+
+    def test_fallback_does_not_pick_duplicates_aliases_or_unreadable_candidates(self):
+        first, second = "a" * 32, "b" * 32
+        explicit = {**self.state, "dataset_id": first}
+        second_state = {**self.state, "dataset_id": second}
+        missing = Result(False, "", "missing", 3)
+        listing = self._listing({"Path": second, "IsDir": True}, {"Path": first, "IsDir": True})
+        for results in (self._record(second_state),
+                        self._record({**second_state, "remote_path": "backup/Café"}),
+                        self._record({**second_state, "remote_path": "Backup/Cafe\u0301"}),
+                        self._record({**second_state, "phase": "interrupted"}),
+                        self._record({**second_state, "dataset_id": first}),
+                        (Result(False, "", "authentication failed", 1),)):
+            with self.subTest(results=results):
+                client = ScriptedRclone(missing, listing, *self._record(explicit), *results)
+                with self.assertRaises(RuntimeError):
+                    find_published_dataset(client, self.task.remote_path)
+        for alias in ("backup/Café", "Backup/Cafe\u0301"):
+            with self.subTest(alias=alias):
+                only_alias = self._listing({"Path": first, "IsDir": True})
+                client = ScriptedRclone(missing, only_alias, *self._record({**explicit, "remote_path": alias}))
+                with self.assertRaises(RuntimeError):
+                    find_published_dataset(client, self.task.remote_path)
+        duplicate = self._listing(*[{"Path": first, "IsDir": True}] * 2)
+        client = ScriptedRclone(missing, duplicate)
+        with self.assertRaises(RuntimeError):
+            find_published_dataset(client, self.task.remote_path)
+        self.assertEqual(len(client.calls), 2)
+        for path, name in (("../../escape", "escape"), ("F" * 32, "F" * 32), (first, "../elsewhere")):
+            with self.subTest(path=path, name=name):
+                listing = self._listing({"Path": path, "Name": name, "IsDir": True})
+                client = ScriptedRclone(missing, listing)
+                with self.assertRaisesRegex(RuntimeError, "不安全"):
+                    find_published_dataset(client, self.task.remote_path)
+                self.assertEqual(len(client.calls), 2)
+
+    def test_absence_is_not_inferred_from_failed_reads_or_invalid_json(self):
+        missing = Result(False, "", "missing", 3)
+        denied = Result(False, "", "not found but unauthorized", 1)
+        for listing in (missing, Result(False, "", "missing", 4), self._listing()):
+            with self.subTest(listing=listing):
+                self.assertIsNone(find_published_dataset(ScriptedRclone(missing, listing), self.task.remote_path))
+        for results in ((denied,), (missing, denied), (missing, Result(True, "null", "", 0)),
+                        (self._record(self.state)[0], Result(False, "", "disappeared", 4)),
+                        (self._record(self.state)[0], Result(True, '{"phase":"ready","phase":"ready"}', "", 0))):
+            with self.subTest(results=results):
+                client = ScriptedRclone(*results)
+                with self.assertRaises(RuntimeError):
+                    find_published_dataset(client, self.task.remote_path)
+                self.assertEqual(len(client.calls), len(results))
+
+    def test_remote_read_and_scan_limits_fail_closed(self):
+        stat, _ = self._record(self.state)
+        for change in ({"IsDir": True}, {"Size": True}, {"Size": -1}, {"Size": 65537},
+                       {"Path": "STATE.JSON"}):
+            with self.subTest(change=change):
+                bad_stat = Result(True, json.dumps({**json.loads(stat.out), **change}), "", 0)
+                client = ScriptedRclone(bad_stat)
+                with self.assertRaises(RuntimeError):
+                    find_published_dataset(client, self.task.remote_path)
+                self.assertEqual(len(client.calls), 1)
+        # rclone output is checked in bytes even if stat underreported the size.
+        oversized = Result(True, "保" * 21846, "", 0)
+        with self.assertRaisesRegex(RuntimeError, "大小"):
+            find_published_dataset(ScriptedRclone(stat, oversized), self.task.remote_path)
+        missing = Result(False, "", "missing", 4)
+        with self.assertRaisesRegex(RuntimeError, "大小"):
+            find_published_dataset(ScriptedRclone(missing, oversized), self.task.remote_path)
+        listing = self._listing(*({"Path": char * 32, "IsDir": True} for char in "abc"))
+        client = ScriptedRclone(missing, listing)
+        with patch("app.core.relay._DATASET_SCAN_LIMIT", 2), self.assertRaisesRegex(RuntimeError, "数量"):
+            find_published_dataset(client, self.task.remote_path)
+        self.assertEqual(len(client.calls), 2)
+
+    def test_cancellation_stops_pending_and_in_flight_reads(self):
+        event = threading.Event()
+        event.set()
+        client = ScriptedRclone()
+        with self.assertRaisesRegex(RuntimeError, "取消"):
+            find_published_dataset(client, self.task.remote_path, cancelled=event)
+        self.assertEqual(client.calls, [])
+
+        class CancelOnLastRead(ScriptedRclone):
+            def run(inner, args, timeout=120, **kwargs):
+                probe = kwargs["cancel_event"]
+                self.assertFalse(probe.is_set())
+                result = super().run(args, timeout, **kwargs)
+                if not inner.results:
+                    event.set()
+                    self.assertTrue(probe.is_set())
+                return result
+
+        missing = Result(False, "", "missing", 3)
+        for results in ((missing,), self._record(self.state), (missing, self._listing())):
+            with self.subTest(results=results):
+                event.clear()
+                client = CancelOnLastRead(*results)
+                with self.assertRaisesRegex(RuntimeError, "取消"):
+                    find_published_dataset(client, self.task.remote_path, cancelled=event.is_set)
+                self.assertEqual(len(client.calls), len(results))
 
 
 class CoordinatorTests(IsolatedTest):

@@ -24,6 +24,147 @@ class ConfigV3Tests(unittest.TestCase):
         environment.start()
         self.addCleanup(environment.stop)
 
+    def _saved_task_with_pending_journal(self) -> tuple[Config, MirrorTask, Path]:
+        config = Config()
+        task = new_task(str(config.path.parent / "source"))
+        config.upsert_task(task)
+        config.save()
+        journal = config.path.parent / "baselines" / f"{task.id}.pending.json"
+        journal.parent.mkdir()
+        journal.write_bytes(b"{malformed")
+        return config, task, journal
+
+    def test_pending_journal_blocks_each_binding_change_from_snapshot(self) -> None:
+        config, task, journal = self._saved_task_with_pending_journal()
+        original = config.path.read_bytes()
+        changes = {
+            "direction": "download",
+            "local_path": str(config.path.parent / "different-source"),
+            "remote_path": "different/mirror",
+            "versions_path": "different/versions",
+            "local_history_path": str(config.path.parent / "different-history"),
+            "dataset_id": "d" * 32,
+            "excludes": ("*.tmp",),
+            "sync_identity": "a" * 32,
+        }
+        for field, value in changes.items():
+            with self.subTest(field=field):
+                draft = config.snapshot()
+                draft.upsert_task(replace(task, **{field: value}))
+                with self.assertRaisesRegex(ValueError, task.id):
+                    draft.save()
+                self.assertEqual(config.path.read_bytes(), original)
+                self.assertEqual(journal.read_bytes(), b"{malformed")
+                self.assertFalse(config.path.with_suffix(".tmp").exists())
+
+    def test_stale_snapshot_cannot_remove_a_newly_saved_task_with_pending_journal(self) -> None:
+        stale = Config().snapshot()
+        config, task, journal = self._saved_task_with_pending_journal()
+        original = config.path.read_bytes()
+
+        with self.assertRaisesRegex(ValueError, task.id):
+            stale.save()
+
+        self.assertEqual(config.path.read_bytes(), original)
+        self.assertEqual(journal.read_bytes(), b"{malformed")
+
+    def test_pending_journal_allows_metadata_only_save(self) -> None:
+        config, task, journal = self._saved_task_with_pending_journal()
+        draft = config.snapshot()
+        metadata = replace(task, name="Renamed", enabled=False, auto_sync=False,
+                           interval_minutes=7, retention_days=45)
+        draft.upsert_task(metadata)
+        draft.mark_task_success(task.id, "2026-11-20T10:00:00", 12)
+        draft.set("nas.password_enc", "rotated-opaque-password")
+        draft.save()
+
+        loaded = Config(config.path)
+        self.assertEqual(loaded.tasks, (replace(metadata, last_sync_at="2026-11-20T10:00:00", last_file_count=12),))
+        self.assertEqual(loaded.get("nas.password_enc"), "rotated-opaque-password")
+        self.assertEqual(journal.read_bytes(), b"{malformed")
+
+    def test_pending_journal_blocks_webdav_url_or_username_change(self) -> None:
+        config, task, journal = self._saved_task_with_pending_journal()
+        original = config.path.read_bytes()
+        for field, value in (("nas.url", "http://other.invalid:8888"), ("nas.username", "another-user")):
+            with self.subTest(field=field):
+                draft = config.snapshot()
+                draft.set(field, value)
+                with self.assertRaisesRegex(ValueError, task.id):
+                    draft.save()
+                self.assertEqual(config.path.read_bytes(), original)
+                self.assertEqual(journal.read_bytes(), b"{malformed")
+
+    def test_pending_journal_blocks_save_when_config_is_missing(self) -> None:
+        config, _, journal = self._saved_task_with_pending_journal()
+        config.path.unlink()
+        config.set("app.minimize_to_tray", False)
+
+        with self.assertRaises(ValueError):
+            config.save()
+
+        self.assertFalse(config.path.exists())
+        self.assertFalse(config.path.with_suffix(".tmp").exists())
+        self.assertEqual(journal.read_bytes(), b"{malformed")
+
+    def test_import_cannot_replace_pending_task_or_unverifiable_saved_binding(self) -> None:
+        config, _, journal = self._saved_task_with_pending_journal()
+        incoming = config.path.with_name("incoming.json")
+        config.export_to(incoming)
+        incoming_bytes = incoming.read_bytes()
+        before = config.snapshot()
+        for saved in ("healthy", "malformed", "missing"):
+            with self.subTest(saved=saved):
+                if saved == "malformed":
+                    config.path.write_bytes(b"{broken config")
+                if saved == "missing":
+                    config.path.unlink()
+                original = config.path.read_bytes() if config.path.exists() else None
+                # Even importing an export of the same task resets sync_identity.
+                with self.assertRaises(ValueError):
+                    config.import_from(incoming)
+                if original is None:
+                    self.assertFalse(config.path.exists())
+                else:
+                    self.assertEqual(config.path.read_bytes(), original)
+                self.assertEqual(incoming.read_bytes(), incoming_bytes)
+                self.assertEqual(journal.read_bytes(), b"{malformed")
+                self.assertEqual(config.data, before.data)
+                self.assertFalse(config.path.with_suffix(".tmp").exists())
+                self.assertEqual(list(config.path.parent.glob("*.backup")), [])
+
+    def test_pending_journal_without_saved_task_blocks_save(self) -> None:
+        config, _, journal = self._saved_task_with_pending_journal()
+        original = config.path.read_bytes()
+        new = new_task(str(config.path.parent / "other-source"))
+        orphan = journal.with_name(f"{new.id}.pending.json")
+        orphan.write_bytes(b"orphan journal")
+        config.upsert_task(new)
+
+        with self.assertRaises(ValueError):
+            config.save()
+
+        self.assertEqual(config.path.read_bytes(), original)
+        self.assertFalse(config.path.with_suffix(".tmp").exists())
+        self.assertEqual(orphan.read_bytes(), b"orphan journal")
+        self.assertEqual(journal.read_bytes(), b"{malformed")
+
+    def test_binding_change_fails_closed_if_baseline_state_is_not_a_directory(self) -> None:
+        config = Config()
+        task = new_task(str(config.path.parent / "source"))
+        config.upsert_task(task)
+        config.save()
+        original = config.path.read_bytes()
+        baselines = config.path.parent / "baselines"
+        baselines.write_bytes(b"unavailable baseline directory")
+        config.remove_task(task.id)
+
+        with self.assertRaises(ValueError):
+            config.save()
+
+        self.assertEqual(config.path.read_bytes(), original)
+        self.assertEqual(baselines.read_bytes(), b"unavailable baseline directory")
+
     def test_first_run_has_no_example_connection_or_automatic_mount_or_start(self) -> None:
         fresh = Config()
         path = fresh.path
@@ -258,7 +399,7 @@ class ConfigV3Tests(unittest.TestCase):
             self.assertIs(migrated.auto_sync, True)
             self.assertEqual(migrated.direction, "upload")
             self.assertEqual(migrated.dataset_id, task.dataset_id)
-            self.assertEqual(migrated.local_history_path, task.local_history_path)
+            self.assertEqual(migrated.local_history_path, str(root / f"offline-source.PhoneNAS-history-{task.id[:8]}"))
             self.assertEqual(config.get("mirror.future_option"), "keep")
             self.assertFalse(backup.exists())
             self.assertEqual(path.read_bytes(), original)

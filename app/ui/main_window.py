@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import uuid
 from dataclasses import replace
 from datetime import datetime
 from time import monotonic
@@ -17,6 +16,7 @@ from app import constants as C
 from app.core import winfsp
 from app.core.autostart import set_autostart
 from app.core.config import Config
+from app.core.history import validate_local_history_path
 from app.core.log import get_logger
 from app.core.mount import MountSupervisor
 from app.core.progress import SyncProgress
@@ -330,11 +330,7 @@ class MainWindow(QMainWindow):
             return
         dialog = TaskDialog(self.config, task, self)
         if self._exec_dialog(dialog) and dialog.task is not None:
-            updated = dialog.task
-            scope = lambda item: (item.direction, item.local_path, item.remote_path, item.versions_path, item.local_history_path, item.dataset_id, item.excludes)
-            if scope(updated) != scope(task):
-                updated = replace(updated, last_sync_at="", last_file_count=0, sync_identity=uuid.uuid4().hex)
-            self._store_task(updated)
+            self._store_task(dialog.task)
 
     def _store_task(self, task: MirrorTask) -> None:
         try:
@@ -354,11 +350,12 @@ class MainWindow(QMainWindow):
         if not self._exec_dialog(dialog):
             return
         try:
-            added = [new_task(folder) for folder in dialog.folders]
+            added = [replace(new_task(folder), auto_sync=False) for folder in dialog.folders]
             tasks = [*self.config.tasks, *added]
             validate_tasks(tasks, self.config.get("mount.drive", C.DEFAULT_DRIVE))
             for task in added:
                 validate_source(task, self.config.get("mount.drive", C.DEFAULT_DRIVE))
+                validate_local_history_path(task.local_history_path)
             draft = self.config.snapshot()
             draft.replace_tasks(tasks)
             draft.save()
@@ -680,15 +677,24 @@ class MainWindow(QMainWindow):
         self._settings_pending = False
         if not self._can_start():
             return
-        signature = self._connection_settings()
-        remount = self.mount.state in ("mounted", "starting", "retrying")
-        if signature != self._connection_signature:
-            self.mount.stop()
-            self._connection_signature = signature
-            if remount:
-                QTimer.singleShot(350, self, self._start_mount)
+        self._reconcile_mount()
         self._reload_tasks()
         self._event("设置", "连接与任务配置已更新", "settings")
+
+    def _reconcile_mount(self, *, setup: bool = False) -> None:
+        signature = self._connection_settings()
+        changed = signature != self._connection_signature
+        was_mounted = self.mount.state in ("mounted", "starting", "retrying")
+        if changed:
+            self.mount.stop()
+            self._connection_signature = signature
+        if setup:
+            if changed and was_mounted:
+                QTimer.singleShot(350, self, self._start_automatic_mount)
+            else:
+                self._start_automatic_mount()
+        elif changed and was_mounted:
+            QTimer.singleShot(350, self, self._start_mount)
 
     def open_wizard(self) -> None:
         if not self._editable():
@@ -706,7 +712,7 @@ class MainWindow(QMainWindow):
             self.settings_page.load()
             self._reload_tasks()
             set_autostart(bool(self.config.get("app.start_with_windows", True)))
-            self._start_automatic_mount()
+            self._reconcile_mount(setup=True)
 
     def toggle_mount(self) -> None:
         if not self._allowed():

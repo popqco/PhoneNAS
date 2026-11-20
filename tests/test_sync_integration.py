@@ -44,6 +44,51 @@ class LocalMirrorIntegrationTests(unittest.TestCase):
             lease_factory=lambda: LocalDatasetLease(self.remote, task),
         )
 
+    def test_empty_history_roots_do_not_keep_a_new_empty_mirror_on_legacy_protocol(self):
+        source = self.base / "source"
+        source.mkdir()
+        (source / "PCB\u200b.txt").write_bytes(b"preserve literal name")
+        task = new_task(str(source))
+        (self.remote / task.remote_path).mkdir(parents=True)
+        (self.remote / task.versions_path).mkdir(parents=True)
+        Path(task.local_history_path).mkdir(parents=True)
+        engine = self.engine(task)
+        report = engine.preview()
+        self.assertFalse(report.blocked, report.reason)
+        self.assertEqual((report.added, report.updated, report.deleted), (1, 0, 0))
+        archived = self.remote / task.versions_path / "2026-11-18_120000"
+        archived.mkdir()
+        with self.assertRaisesRegex(RuntimeError, "旧数据集"):
+            engine.preview()
+        self.assertTrue(archived.is_dir())
+        self.assertEqual(list((self.remote / task.remote_path).iterdir()), [])
+        archived.rmdir()
+        engine.execute(report)
+        self.assertEqual((self.remote / task.remote_path / "PCB\u200b.txt").read_bytes(), b"preserve literal name")
+
+    def test_separate_dataset_cannot_claim_another_mirror_or_archive(self):
+        from app.core.relay import LocalDatasetLease
+
+        first_root, second_root = self.base / "first", self.base / "second"
+        for root in (first_root, second_root):
+            root.mkdir()
+            (root / "file.txt").write_text(root.name, encoding="utf-8")
+        archive = "Archives/shared"
+        first = new_task(str(first_root), remote_path="Shared/current", versions_path=archive, dataset_id="e" * 32)
+        (self.remote / archive).mkdir(parents=True)
+        first_engine = self.engine(first)
+        first_engine.execute(first_engine.preview())
+        for mirror, history in (("Shared/current", "Archives/independent"),
+                                ("Other/current", "archives/SHARED"),
+                                ("Other/current", "Shared")):
+            with self.subTest(mirror=mirror, history=history), LocalDatasetLease(self.remote, first):
+                second = new_task(str(second_root), remote_path=mirror, versions_path=history)
+                with self.assertRaisesRegex(RuntimeError, "另一个数据集重叠"):
+                    self.engine(second, state_name="second-state").preview()
+                self.assertFalse((self.remote / second.dataset_control_path).exists())
+        self.assertEqual((self.remote / first.remote_path / "file.txt").read_text(encoding="utf-8"), "first")
+        self.assertEqual(list((self.remote / archive).iterdir()), [])
+
     def test_unicode_names_publish_receive_and_archive_without_renaming(self):
         source = self.base / "office"
         source.mkdir()
@@ -153,6 +198,10 @@ class LocalMirrorIntegrationTests(unittest.TestCase):
         stamp = returned.execute(plan)
         self.assertEqual((self.remote / publisher.remote_path / "drawing.txt").read_text(), "editing at home!")
         self.assertEqual((self.remote / publisher.versions_path / stamp / "drawing.txt").read_text(), "company revision")
+        # Moving only the local archive must not let a stale publisher take
+        # over a newer phone mirror or lose the ability to adopt that revision.
+        new_history = self.base / "new-company-history"
+        publisher = replace(publisher, local_history_path=str(new_history))
         stale_company = self.engine(publisher).preview()
         self.assertTrue(stale_company.blocked)
         self.assertIn("接收手机", stale_company.reason)

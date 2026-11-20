@@ -1,4 +1,4 @@
-"""Filename protocol tests with real rclone and a disposable loopback WebDAV server."""
+﻿"""Filename protocol tests with real rclone and a disposable loopback WebDAV server."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ from app.core.config import Config
 from app.core.history import HistoryService, LocalHistoryService
 from app.core.sync import SyncEngine
 from app.core.tasks import new_task
+from app.core.winpath import extended_path
 from webdav_fixture import serve_webdav
 
 
@@ -104,6 +105,42 @@ class WebDAVFilenameTests(unittest.TestCase):
         self.config = Config(self.root / "config.json")
         self.config.set("nas.url", endpoint)
         self.client = rclone.Rclone(self.config, conf_path=conf)
+
+    def test_picker_loads_live_parent_and_returns_existing_literal_path_without_writes(self):
+        import time
+
+        from PySide6.QtCore import Qt
+        from PySide6.QtTest import QTest
+        from PySide6.QtWidgets import QApplication, QDialog
+
+        from app.ui.remote_folder_dialog import RemoteFolderDialog
+
+        app = QApplication.instance() or QApplication([])
+        initial = "PhoneNasHistory/设计\u200b"
+        (self.remote / initial).mkdir(parents=True)
+        before = _tree(self.remote)
+        dialog = RemoteFolderDialog(self.config, purpose="history", current_path=initial)
+        try:
+            dialog.show()
+            deadline = time.monotonic() + 10
+            while dialog.busy and time.monotonic() < deadline:
+                QTest.qWait(20)
+            self.assertFalse(dialog.busy, dialog.status_label.text())
+            self.assertIn("PhoneNasHistory", dialog.path_label.text())
+            self.assertEqual(dialog.tree.topLevelItemCount(), 1, dialog.status_label.text())
+            item = dialog.tree.selectedItems()[0]
+            self.assertEqual(item.text(0), "设计<U+200B>")
+            self.assertEqual(item.data(0, Qt.ItemDataRole.UserRole), initial)
+            dialog.choose_button.click()
+            self.assertEqual(dialog.result(), QDialog.DialogCode.Accepted)
+            self.assertEqual(dialog.remote_path, initial)
+            self.assertIn("PROPFIND", self.requests)
+            self.assertLessEqual(set(self.requests), {"OPTIONS", "PROPFIND", "HEAD", "GET"})
+            self.assertEqual(_tree(self.remote), before)
+        finally:
+            dialog.close()
+            dialog.deleteLater()
+            app.processEvents()
 
     def engine(self, task, *, operation=""):
         return SyncEngine(self.client, task, operation=operation, state_directory=self.state,
@@ -305,6 +342,36 @@ class WebDAVFilenameTests(unittest.TestCase):
                 self._write_v1_baseline(task, snapshot)
                 self._assert_read_only_preview(self.engine(task), refusal="文件名协议|旧")
                 self.assertFalse(self.lock(task).exists())
+
+    @unittest.skipUnless(os.name == "nt", "MAX_PATH staging regression is Windows-specific")
+    def test_first_publish_cleans_staging_when_source_is_near_max_path(self):
+        source = self.root / "deep-office"
+        source.mkdir()
+        staging_prefix = len(str(Path(tempfile.gettempdir()) / "PhoneNAS-staged-aaaaaaaa" / "files")) + 1
+        relative = ""
+        for count in range(1, 9):
+            candidate = "/".join(["d" * 32] * count + ["probe.txt"])
+            source_length = len(str(source)) + 1 + len(candidate)
+            if source_length < 260 and staging_prefix + len(candidate) > 260:
+                relative = candidate
+                break
+        if not relative:
+            self.skipTest("temporary paths cannot exercise the MAX_PATH boundary")
+        target = source.joinpath(*relative.split("/"))
+        self.assertLess(len(str(target)), 260)
+        Path(extended_path(target.parent)).mkdir(parents=True, exist_ok=True)
+        Path(extended_path(target)).write_bytes(b"deep source")
+
+        task = new_task(str(source), remote_path="m")
+        engine = self.engine(task)
+        report = engine.preview()
+        self.assertFalse(report.blocked, report.reason)
+        self.assertEqual(report.changes, (("+", relative),))
+        engine.execute(report)
+
+        remote_file = self.remote / task.remote_path / relative
+        self.assertEqual(Path(extended_path(remote_file)).read_bytes(), b"deep source")
+        self.assertEqual(list(Path(tempfile.gettempdir()).glob("PhoneNAS-staged-*")), [])
 
     def test_legacy_v1_ordinary_files_can_publish_and_receive_without_upgrading(self):
         source, target = self.root / "office", self.root / "home"

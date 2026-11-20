@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 
 APP_NAME = "PhoneNAS"
-APP_VERSION = "1.2.4"
+APP_VERSION = "1.2.6"
 
 DEFAULT_URL = "http://100.109.166.11:8888"
 DEFAULT_REMOTE = "phone"

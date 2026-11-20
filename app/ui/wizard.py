@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 from app import constants as C
 from app.core import winfsp
 from app.core.config import Config
+from app.core.history import validate_local_history_path
 from app.core.tasks import (
     MAX_INTERVAL_MINUTES, MAX_RETENTION_DAYS, MIN_INTERVAL_MINUTES, MIN_RETENTION_DAYS,
     MirrorTask, new_task, validate_source, validate_tasks,
@@ -387,7 +388,7 @@ class WizardDialog(QDialog, _AsyncOperations):
     def _browse(self) -> None:
         if self.busy or self._shutting_down or self.direction_combo.currentData() != "upload":
             return
-        dialog = MultiFolderDialog(self)
+        dialog = MultiFolderDialog(self, staging=True)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             dialog.deleteLater()
             return
@@ -527,6 +528,7 @@ class WizardDialog(QDialog, _AsyncOperations):
             for task in request.tasks:
                 worker.check_cancelled()
                 validate_source(task, request.drive)
+                validate_local_history_path(task.local_history_path)
             draft.replace_tasks(combined)
             worker.check_cancelled()
             installed = winfsp.is_installed() if request.mount_enabled else None

@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-import tempfile
 import threading
 import uuid
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -19,6 +19,7 @@ from app.core.progress import SyncProgress
 from app.core.rclone import Rclone
 from app.core.retention import old_versions, version_timestamp
 from app.core.tasks import MirrorTask, validate_source, validate_tasks
+from app.core.winpath import staging_directory
 
 
 @dataclass(frozen=True)
@@ -195,12 +196,12 @@ class SyncEngine:
             raise RuntimeError("操作已取消")
 
     def _validate(self) -> None:
-        from app.core.history import _no_links
+        from app.core.history import _no_links, validate_local_history_path
         self._check_cancel()
         validate_tasks((self.task,), self.mount_drive)
         validate_source(self.task, self.mount_drive)
         _no_links(Path(self.task.local_path))
-        _no_links(Path(self.task.local_history_path))
+        validate_local_history_path(self.task.local_history_path)
 
     def _context(self):
         from app.core.relay import BaselineStore, DatasetCoordinator
@@ -255,10 +256,12 @@ class SyncEngine:
         mirror = self._namespace(remote_root, allow_missing=True)
         if mirror is not None and any(mirror):
             return LEGACY
-        # A history directory's existence is evidence of use even if it is now
-        # empty. Never bless old batches with a new dataset-wide v2 marker.
+        # Browsing may select a pre-created empty directory. The verified
+        # unfiltered namespace must be empty, not just free of files or of
+        # managed matches; old batches and even empty children still count.
         for history in (f"{C.DEFAULT_REMOTE}:{self.task.versions_path}", self.task.local_history_path):
-            if self._namespace(history, allow_missing=True) is not None:
+            archive = self._namespace(history, allow_missing=True)
+            if archive is not None and any(archive):
                 return LEGACY
         return LITERAL
 
@@ -319,6 +322,7 @@ class SyncEngine:
 
     def _baseline_initialization_state(self, *, check_lock: bool = True):
         from app.core.pending import PendingOperation
+        from app.core.relay import verify_remote_scope
         self._stage("inspect_control", "正在核对首次基线的连接、保护锁与发布状态…")
         self._validate()
         store, coordinator = self._context()
@@ -327,7 +331,9 @@ class SyncEngine:
         if check_lock and coordinator.locked():
             raise RuntimeError("数据集锁已占用；不会初始化共同基线或接管旧锁。")
         metadata = coordinator.read()
-        if metadata is not None and metadata["phase"] != "ready":
+        if metadata is None:
+            verify_remote_scope(self.rclone, self.task, cancelled=self.cancelled)
+        elif metadata["phase"] != "ready":
             raise RuntimeError("手机数据集有未完成的发布，不能初始化共同基线。")
         # Adoption operates on existing trees, so an unmarked tree stays v1.
         protocol = metadata["version"] if metadata else LEGACY
@@ -359,6 +365,8 @@ class SyncEngine:
         self, approved: BaselineInitializationPreview,
     ) -> BaselineInitializationResult:
         """Initialize control state and a local baseline, never transfer payloads."""
+        from app.core.relay import verify_remote_scope
+
         if type(approved) is not BaselineInitializationPreview:
             raise ValueError("必须明确确认首次基线预览")
         fresh, store, coordinator, _, _, _, _, _ = self._baseline_initialization_state()
@@ -375,9 +383,13 @@ class SyncEngine:
                 "generation": generation, "content_digest": remote.digest,
                 "writer_identity": self.task.sync_identity,
             }
+            started = False
             try:
                 if created_metadata:
-                    coordinator.write("ready", generation, content_digest=remote.digest, protocol=protocol)
+                    with coordinator.registration_lease(lease):
+                        verify_remote_scope(self.rclone, self.task, cancelled=self.cancelled)
+                        started = True
+                        coordinator.write("ready", generation, content_digest=remote.digest, protocol=protocol)
                 if coordinator.read() != expected:
                     raise RuntimeError("首次基线的数据集状态回读核对失败；没有保存本地基线。")
                 # Read both full trees again after the ready response: metadata
@@ -395,8 +407,8 @@ class SyncEngine:
                     raise RuntimeError("操作已取消")
             except BaseException:
                 # A write may have reached the endpoint despite a failed reply.
-                # Do not expose uncertain ready metadata to another operation.
-                lease.retain()
+                if started:
+                    lease.retain()
                 raise
         # Save only after successful owner-checked release. A cleanup failure
         # must not leave a newly persisted baseline behind a reported failure.
@@ -407,7 +419,7 @@ class SyncEngine:
         return BaselineInitializationResult(generation, len(final_remote.files), created_metadata)
 
     def _inspect(self, *, check_lock: bool = True, recovery_token: str | None = None):
-        from app.core.relay import ContentSnapshot
+        from app.core.relay import ContentSnapshot, verify_remote_scope
         self._stage("inspect_control", "正在核对任务路径、保护锁与发布状态…")
         self._validate()
         store, coordinator = self._context()
@@ -426,6 +438,8 @@ class SyncEngine:
         if check_lock and self.recovering and not self.receiving and not coordinator.locked():
             raise RuntimeError("上次发布的所有权锁已缺失，不能证明仍由原操作独占；请先保留两端文件并核对。")
         metadata = coordinator.read()
+        if metadata is None and not self.receiving:
+            verify_remote_scope(self.rclone, self.task, cancelled=self.cancelled)
         protocol, baseline, conflict = self._verify_protocol(store, metadata, pending)
         allow_missing = not self.receiving and self.operation == "publish"
         local = self._snapshot("inspect_local", "正在校验本地文件内容…",
@@ -564,8 +578,9 @@ class SyncEngine:
         return self._inspect()
 
     def execute(self, report: SyncReport) -> str:
-        from app.core.relay import ContentSnapshot
         from app.core.history import _no_links
+        from app.core.relay import ContentSnapshot, verify_remote_scope
+
         if report.blocked:
             raise RuntimeError(report.reason or "内容保护已阻止执行")
         if not self.recovering and report.operation != self.operation:
@@ -623,7 +638,7 @@ class SyncEngine:
             history_root = self._history_root(stamp)
             payload_started = False
             try:
-                with tempfile.TemporaryDirectory(prefix="PhoneNAS-staged-") as temporary:
+                with staging_directory() as temporary:
                     staged = Path(temporary) / "files"
                     staged.mkdir()
                     changed = [path for path, mark in marks.items() if mark in ("+", "*")]
@@ -658,15 +673,23 @@ class SyncEngine:
                         raise RuntimeError("本次历史批次位置已被占用，未写入目标，请重新核对。")
                     if self.cancelled.is_set():
                         raise RuntimeError("操作已取消")
-                    if not interrupted:
-                        journal.save(
-                            operation=self.operation, local=local, remote=remote,
-                            generation=generation, stamp=stamp, lock_token=lease.token,
-                            prior_metadata=metadata, protocol=protocol,
-                        )
-                    payload_started = True
-                    if not self.receiving:
-                        coordinator.write("publishing", generation, content_digest=source.digest, protocol=protocol)
+                    registering = not self.receiving and metadata is None
+                    registration = coordinator.registration_lease(lease) if registering else nullcontext()
+                    with registration:
+                        if registering:
+                            verify_remote_scope(self.rclone, self.task, cancelled=self.cancelled)
+                            if protocol == LITERAL and interrupted is None and self._new_protocol(store) != LITERAL:
+                                raise RuntimeError("首次发布的镜像、历史或本机状态已变化；未写入文件，请重新查看差异。")
+                        self._check_cancel()
+                        if not interrupted:
+                            journal.save(
+                                operation=self.operation, local=local, remote=remote,
+                                generation=generation, stamp=stamp, lock_token=lease.token,
+                                prior_metadata=metadata, protocol=protocol,
+                            )
+                        payload_started = True
+                        if not self.receiving:
+                            coordinator.write("publishing", generation, content_digest=source.digest, protocol=protocol)
                     self._stage("applying", "正在写入本地接收目录…" if self.receiving else "正在上传写入手机镜像…")
                     if not self.receiving:
                         self._require(self.rclone.mkdir(self.task.remote_path), "创建镜像目录失败")
@@ -712,7 +735,7 @@ class SyncEngine:
             # existing offline history on this computer. Local batches remain
             # available for explicit, verified deletion but are not auto-expired.
             if protocol == LITERAL and not self.receiving:
-                self._clean_history()
+                self._clean_history(coordinator, lease)
             self._stage("releasing", "正在释放任务锁；尚未报告任务完成…")
             return stamp
 
@@ -814,14 +837,22 @@ class SyncEngine:
             if log_handle:
                 log_handle.close()
 
-    def _clean_history(self) -> None:
+    def _clean_history(self, coordinator, lease) -> None:
         from app.core.history import HistoryService
-        # execute() already holds the dataset lease for this literal publication.
+        from app.core.relay import verify_remote_scope
+
         history = HistoryService(self.rclone, self.task, protocol=LITERAL)
         try:
-            for name in old_versions(history.list_versions(), self.task.retention_days):
-                self._validate()
-                history.delete(name)
+            expired = old_versions(history.list_versions(), self.task.retention_days)
+            if not expired:
+                return
+            # The dataset lease protects the batch; the registration lease
+            # prevents another dataset claiming this archive during expiry.
+            with coordinator.registration_lease(lease):
+                verify_remote_scope(self.rclone, self.task, require_ready=True, cancelled=self.cancelled)
+                for name in expired:
+                    self._validate()
+                    history.delete(name)
         except Exception as exc:
             self._stage("cleanup", f"文件内容已核验；历史清理未完成：{exc}")
 

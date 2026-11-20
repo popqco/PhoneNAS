@@ -82,7 +82,7 @@ class BaselineInitializationTests(unittest.TestCase):
         (self.local / "ignored.tmp").write_bytes(b"local ignored content")
         (self.mirror / "ignored.tmp").write_bytes(b"different ignored content")
         self.history = Path(self.task.local_history_path)
-        self.history.mkdir()
+        self.history.mkdir(parents=True)
         (self.history / "history-sentinel.txt").write_bytes(b"never clean history")
         versions = self.remote / self.task.versions_path
         versions.mkdir(parents=True)

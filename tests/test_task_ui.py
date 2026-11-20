@@ -71,7 +71,7 @@ class TaskUiTests(unittest.TestCase):
             time.sleep(0.001)
         self.assertTrue(predicate(), "UI operation did not finish")
 
-    def test_remote_picker_is_inert_until_clicked_and_returns_only_safe_listed_directory(self):
+    def test_remote_picker_loads_on_open_and_returns_only_safe_listed_directory(self):
         from app.ui.remote_folder_dialog import RemoteFolderDialog
 
         requests = []
@@ -103,13 +103,11 @@ class TaskUiTests(unittest.TestCase):
         before = copy.deepcopy(self.config.data)
         with patch("app.ui.remote_folder_dialog.Rclone", FakeRclone):
             dialog = self.keep(RemoteFolderDialog(self.config))
-            dialog.show()
-            QTest.qWait(20)
-            self.assertFalse(dialog.busy)
             self.assertEqual(requests, [])
             self.assertFalse(dialog.choose_button.isEnabled())
-            dialog.refresh_button.click()
+            dialog.show()
             self.wait_for(lambda: not dialog.busy and dialog.tree.topLevelItemCount() == 2)
+            self.assertEqual(len(requests), 1)
             self.assertEqual(requests[0][0][:2], ["lsjson", "phone:"])
             self.assertIn("--dirs-only", requests[0][0])
             self.assertIn("--max-depth", requests[0][0])
@@ -175,6 +173,130 @@ class TaskUiTests(unittest.TestCase):
             dialog.choose_button.click()
             self.assertEqual(dialog.remote_path, "backup/mirror")
 
+    def test_remote_picker_starts_at_saved_path_parent_and_retries_requested_directory(self):
+        from app.ui.remote_folder_dialog import RemoteFolderDialog
+
+        requests = []
+        responses = [
+            Result(True, '[{"Path":"history","IsDir":true}]', "", 0),
+            Result(False, "", "temporary read failure", 1),
+            Result(True, '[]', "", 0),
+            Result(True, '{"IsDir":true}', "", 0),
+        ]
+
+        class FakeRclone:
+            def __init__(self, config, conf_path=None):
+                pass
+
+            def ensure_conf(self):
+                pass
+
+            def run(self, args, **kwargs):
+                requests.append(args[1])
+                return responses.pop(0)
+
+            def cancel(self):
+                pass
+
+        with patch("app.ui.remote_folder_dialog.Rclone", FakeRclone):
+            dialog = self.keep(RemoteFolderDialog(self.config, purpose="history", current_path="archives/history"))
+            dialog.show()
+            self.wait_for(lambda: dialog.choose_button.isEnabled())
+            self.assertEqual(requests, ["phone:archives"])
+            self.assertIn("手机历史", dialog.windowTitle())
+            self.assertEqual(dialog.tree.selectedItems()[0].text(0), "history")
+            dialog.tree.itemDoubleClicked.emit(dialog.tree.selectedItems()[0], 0)
+            self.wait_for(lambda: not dialog.busy)
+            self.assertIn("archives/history", dialog.path_label.text())
+            self.assertIn("读取失败", dialog.status_label.text())
+            self.assertFalse(dialog.choose_button.isEnabled())
+            dialog.refresh_button.click()
+            self.wait_for(lambda: not dialog.busy)
+            self.assertEqual(requests, ["phone:archives", *["phone:archives/history"] * 3])
+            self.assertIn("没有子目录", dialog.status_label.text())
+            dialog.choose_button.click()
+            self.assertEqual(dialog.remote_path, "archives/history")
+
+    def test_suggested_parent_falls_back_to_root_and_reserved_dirs_are_not_selectable(self):
+        from app.ui.remote_folder_dialog import RemoteFolderDialog
+
+        requests = []
+
+        class FakeRclone:
+            def __init__(self, config, conf_path=None):
+                pass
+
+            def ensure_conf(self):
+                pass
+
+            def run(self, args, **kwargs):
+                path = args[1]
+                requests.append(path)
+                if path == "phone:missing-parent":
+                    return Result(False, "", "directory not found", 3)
+                return Result(True, '[{"Path":".PhoneNAS","IsDir":true},{"Path":" bad","IsDir":true}]', "", 0)
+
+            def cancel(self):
+                pass
+
+        with patch("app.ui.remote_folder_dialog.Rclone", FakeRclone):
+            dialog = self.keep(RemoteFolderDialog(self.config, current_path="missing-parent/draft"))
+            dialog.show()
+            self.wait_for(lambda: not dialog.busy)
+            self.assertEqual(requests, ["phone:missing-parent", "phone:"])
+            self.assertEqual(dialog.path_label.text(), "phone:/")
+            self.assertEqual(dialog.tree.topLevelItemCount(), 0)
+            self.assertIn("2 个目录不能选择", dialog.status_label.text())
+            self.assertFalse(dialog.choose_button.isEnabled())
+
+    def test_history_browse_buttons_set_only_their_own_path_without_creating_any_directory(self):
+        from app.ui.task_dialog import TaskDialog
+
+        requests = []
+
+        class FakeRclone:
+            def __init__(self, config, conf_path=None):
+                pass
+
+            def ensure_conf(self):
+                pass
+
+            def run(self, args, **kwargs):
+                requests.append(args[1])
+                return Result(True, '[{"Path":"custom-history","IsDir":true}]', "", 0)
+
+            def cancel(self):
+                pass
+
+        dialog = self.keep(TaskDialog(self.config))
+        dialog.local_edit.setText(str(self.source))
+        mirror = dialog.remote_edit.text()
+        dialog.show()
+        with patch("app.ui.remote_folder_dialog.Rclone", FakeRclone):
+            dialog.versions_edit.setText("archives/unused")
+            dialog.browse_versions_button.click()
+            picker = self.app.activeModalWidget()
+            self.assertIsNot(picker, dialog)
+            self.wait_for(lambda: not picker.busy and picker.tree.topLevelItemCount() == 1)
+            self.assertFalse(picker.choose_button.isEnabled())  # Never silently choose the parent of the missing draft.
+            self.assertIn("未找到原路径", picker.status_label.text())
+            picker.tree.setCurrentItem(picker.tree.topLevelItem(0))
+            picker.choose_button.click()
+        self.assertEqual(requests, ["phone:archives"])
+        self.assertEqual(dialog.versions_edit.text(), "archives/custom-history")
+        self.assertEqual(dialog.remote_edit.text(), mirror)
+        new_local_history = self.base / "picked-history"
+        new_local_history.mkdir()
+        with patch("app.ui.task_dialog.QFileDialog.getExistingDirectory", return_value=str(new_local_history)):
+            dialog.browse_local_history_button.click()
+        self.assertEqual(dialog.local_history_edit.text(), str(new_local_history))
+        dialog.save_button.click()
+        self.assertEqual(dialog.result(), QDialog.DialogCode.Accepted)
+        self.assertEqual(dialog.task.local_history_path, str(new_local_history))
+        self.assertEqual(dialog.task.versions_path, "archives/custom-history")
+        self.assertEqual(list(new_local_history.iterdir()), [])
+        self.assertFalse(self.config.path.exists())
+
     def test_new_receive_task_requires_explicit_existing_remote_and_keeps_local_history_outside_data(self):
         from app.ui.task_dialog import TaskDialog
 
@@ -188,12 +310,12 @@ class TaskUiTests(unittest.TestCase):
         dialog.save_button.click()
         self.assertIsNone(dialog.task)
         self.assertIn("已有", dialog.error_label.text())
-        self.assertIn("接收", dialog.local_caption.text())
+        self.assertIn("下载的目标", dialog.local_caption.text())
         dialog.remote_edit.setText("backup/company/mirror")
         self.assertEqual(dialog.versions_edit.text(), "backup/company/versions")
         history = Path(dialog.local_history_edit.text())
         self.assertTrue(history.is_absolute())
-        self.assertEqual(history.parent, self.source.parent)
+        self.assertEqual(history.parent, self.source.parent / "PhoneNAS-本地历史")
         self.assertNotEqual(history, self.source)
         dialog.interval_spin.setValue(1)
         dialog.retention_spin.setValue(3650)
@@ -208,6 +330,75 @@ class TaskUiTests(unittest.TestCase):
         self.assertEqual(dialog.interval_spin.maximum(), 1440)
         self.assertEqual(self.config.data, before)
         self.assertFalse(self.config.path.exists())
+
+    def test_selecting_published_receive_mirror_carries_exact_remote_scope(self):
+        from app.ui.task_dialog import TaskDialog
+
+        requests = []
+        rules = [" logs/", "data\u2029at/work", "/literal[\u2421].txt"]
+        scope = {"dataset_id": "f" * 32, "remote_path": "shared/warehouse/mirror",
+                 "versions_path": "an-unrelated/archive/测试", "excludes": rules}
+
+        class FakeRclone:
+            def __init__(self, config, conf_path=None):
+                pass
+
+            def ensure_conf(self):
+                pass
+
+            def run(self, args, **kwargs):
+                requests.append(args[:2])
+                return Result(True, '[{"Path":"mirror","IsDir":true}]', "", 0)
+
+            def cancel(self):
+                pass
+
+        dialog = self.keep(TaskDialog(self.config))
+        dialog.show()
+        dialog.direction_combo.setCurrentIndex(dialog.direction_combo.findData("download"))
+        dialog.local_edit.setText(str(self.source))
+        dialog.remote_edit.setText(scope["remote_path"])
+        dialog.save_button.click()
+        self.assertIsNone(dialog.task)
+        self.assertIn("浏览手机", dialog.error_label.text())
+        self.assertEqual(dialog.name_edit.text(), "warehouse")
+        with (patch("app.ui.remote_folder_dialog.Rclone", FakeRclone),
+              patch("app.ui.remote_folder_dialog.find_published_dataset", return_value=scope) as lookup):
+            dialog.browse_remote_button.click()
+            picker = self.app.activeModalWidget()
+            self.wait_for(lambda: picker.choose_button.isEnabled())
+            picker.choose_button.click()
+            self.wait_for(lambda: self.app.activeModalWidget() is dialog)
+        self.assertEqual(requests, [["lsjson", "phone:shared/warehouse"]])
+        self.assertEqual(lookup.call_args.args[1], scope["remote_path"])
+        self.assertEqual(dialog.versions_edit.text(), scope["versions_path"])
+        self.assertTrue(dialog.versions_edit.isReadOnly())
+        self.assertTrue(dialog.browse_versions_button.isEnabled())
+        self.assertEqual(dialog.browse_versions_button.text(), "查看手机…")
+        self.assertFalse(dialog.preset_combo.isEnabled())
+        dialog.save_button.click()
+        self.assertEqual(dialog.result(), QDialog.DialogCode.Accepted)
+        self.assertEqual(dialog.task.dataset_id, scope["dataset_id"])
+        self.assertEqual(dialog.task.versions_path, scope["versions_path"])
+        self.assertEqual(dialog.task.excludes, tuple(rules))
+        self.assertFalse(dialog.task.enabled)
+        self.assertFalse(dialog.task.auto_sync)
+
+    def test_changing_only_local_history_preserves_identity_and_saved_rules(self):
+        from app.core.tasks import new_task
+        from app.ui.task_dialog import TaskDialog
+
+        original = replace(new_task(str(self.source)), excludes=("old-build/", " cache/**"),
+                           last_sync_at="2026-11-14T12:00:00", last_file_count=12)
+        self.config.upsert_task(original)
+        dialog = self.keep(TaskDialog(self.config, original, operational=False))
+        dialog.name_edit.setText("工作资料")
+        history = self.base / "new history"
+        dialog.local_history_edit.setText(str(history))
+        dialog.save_button.click()
+        self.assertEqual(dialog.result(), QDialog.DialogCode.Accepted)
+        self.assertEqual(dialog.task, replace(original, name="工作资料", local_history_path=str(history)))
+        self.assertFalse(history.exists())
 
     def test_task_save_keeps_literal_custom_rule_whitespace_and_unicode(self):
         from app.ui.task_dialog import TaskDialog
@@ -250,11 +441,12 @@ class TaskUiTests(unittest.TestCase):
         self.assertEqual(self.config.data, before)
         self.assertFalse(self.config.path.exists())
 
-    def test_new_receive_defaults_to_manual_without_turning_automatic_back_on(self):
+    def test_new_tasks_start_manual_and_receive_never_turns_automatic_back_on(self):
         from app.ui.task_dialog import TaskDialog
 
         dialog = self.keep(TaskDialog(self.config, operational=False))
-        self.assertTrue(dialog.auto_sync_check.isChecked())
+        self.assertFalse(dialog.auto_sync_check.isChecked())
+        dialog.auto_sync_check.setChecked(True)
         dialog.direction_combo.setCurrentIndex(dialog.direction_combo.findData("download"))
         self.assertFalse(dialog.enabled_check.isChecked())
         self.assertFalse(dialog.auto_sync_check.isChecked())
@@ -450,7 +642,7 @@ class TaskUiTests(unittest.TestCase):
         self.config.set("mount.enabled", False)
 
         class FakeFolderDialog(QDialog):
-            def __init__(self, parent=None):
+            def __init__(self, parent=None, *, staging=False):
                 super().__init__(parent)
                 self.folders = [str(self_source)]
 
@@ -488,7 +680,7 @@ class TaskUiTests(unittest.TestCase):
         source = self.source
 
         class FakeFolderDialog(QDialog):
-            def __init__(self, parent=None):
+            def __init__(self, parent=None, *, staging=False):
                 super().__init__(parent)
                 self.folders = [str(source)]
 

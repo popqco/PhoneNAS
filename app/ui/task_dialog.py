@@ -34,9 +34,11 @@ from PySide6.QtWidgets import (
 
 from app import constants as C
 from app.core.config import Config
+from app.core.history import validate_history_inventory, validate_local_history_path
 from app.core.tasks import (
     MAX_INTERVAL_MINUTES, MAX_RETENTION_DAYS, MIN_INTERVAL_MINUTES, MIN_RETENTION_DAYS,
-    MirrorTask, new_task, normalize_remote_path, validate_source, validate_tasks,
+    MirrorTask, dataset_id_for_remote, new_task, normalize_remote_path, suggest_local_history,
+    suggest_phone_history, suggest_phone_paths, validate_source, validate_tasks,
 )
 from app.ui.pages.settings import _operational
 from app.ui.remote_folder_dialog import RemoteFolderDialog
@@ -73,14 +75,25 @@ def _tab_body() -> tuple[QScrollArea, QWidget, QVBoxLayout]:
     return scroll, body, layout
 
 
-def _field(title: str, editor: QWidget, hint: str = "") -> QWidget:
+def _browse_row(editor: QLineEdit, browse: QWidget) -> QWidget:
+    row = QWidget()
+    layout = QHBoxLayout(row)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(9)
+    editor.setMinimumWidth(0)
+    layout.addWidget(editor, 1)
+    layout.addWidget(browse)
+    return row
+
+
+def _field(title: str, editor: QWidget, hint: str = "", *, buddy: QWidget | None = None) -> QWidget:
     result = QWidget()
     result.setMinimumWidth(0)
     layout = QVBoxLayout(result)
     layout.setContentsMargins(0, 0, 0, 0)
     layout.setSpacing(7)
     caption = label(title, "field")
-    caption.setBuddy(editor)
+    caption.setBuddy(buddy if buddy is not None else editor)
     layout.addWidget(caption)
     layout.addWidget(editor)
     if hint:
@@ -103,7 +116,7 @@ class TaskDialog(QDialog):
         self.operational = operational
         self.task: MirrorTask | None = None
         self._original = task
-        self._draft = task if task is not None else new_task("")
+        self._draft = task if task is not None else replace(new_task(""), auto_sync=False)
         self._is_new = task is None
         self._name_edited = not self._is_new
         self._manual_targets = not self._is_new
@@ -113,9 +126,13 @@ class TaskDialog(QDialog):
         self._updating_targets = False
         self._purpose = self._draft.direction
         self._remote_dialog: RemoteFolderDialog | None = None
+        self._browse_purpose = ""
+        self._published_scope: dict | None = None
         self._loading = True
         self._previous_preset = ""
-        self._custom_rules = "\n".join(self._draft.excludes)
+        self._saved_rule_preset = self._draft.exclude_preset
+        self._saved_rules = self._draft.excludes
+        self._custom_rules = "\n".join(self._saved_rules)
         self._initial_custom_text: str | None = None
         self.setWindowTitle("添加同步任务 · PhoneNAS" if self._is_new else "编辑同步任务 · PhoneNAS")
         self.setModal(True)
@@ -185,97 +202,62 @@ class TaskDialog(QDialog):
         self.name_edit = QLineEdit(self._draft.name if not self._is_new else "")
         self.name_edit.setObjectName("taskName")
         self.name_edit.setPlaceholderText("例如：工作文件、产品文档")
-        self.name_edit.setMaxLength(120)
+        self.name_edit.setMaxLength(max(120, len(self.name_edit.text().encode("utf-16-le", errors="surrogatepass")) // 2))
         self.name_edit.textEdited.connect(self._name_changed)
         layout.addWidget(_field("任务名称", self.name_edit))
 
-        source = QWidget()
-        source_row = QHBoxLayout(source)
-        source_row.setContentsMargins(0, 0, 0, 0)
-        source_row.setSpacing(9)
         self.local_edit = QLineEdit(self._draft.local_path)
         self.local_edit.setObjectName("taskSource")
-        self.local_edit.setPlaceholderText("选择电脑上需要备份的文件夹")
         self.local_edit.textChanged.connect(self._source_changed)
-        self.browse_button = button("选择文件夹…", "secondary", "folder")
+        self.browse_button = button("浏览电脑…", "secondary", "folder")
+        self.browse_button.setAccessibleName("选择电脑上的工作目录")
         self.browse_button.clicked.connect(self._browse)
-        source_row.addWidget(self.local_edit, 1)
-        source_row.addWidget(self.browse_button)
-        self.local_caption = label("本地来源目录 · 上传发布", "field")
+        self.local_caption = label("", "field")
         self.local_caption.setBuddy(self.local_edit)
         layout.addWidget(self.local_caption)
-        layout.addWidget(source)
-        self.local_hint = label("只读取本地来源；保存时会检查文件夹确实存在且可读。", "small")
+        layout.addWidget(_browse_row(self.local_edit, self.browse_button))
+        self.local_hint = label("", "small")
         self.local_hint.setWordWrap(True)
         layout.addWidget(self.local_hint)
 
-        mapping = Card()
-        mapping.setProperty("variant", "mapping")
-        mapping_layout = QVBoxLayout(mapping)
-        mapping_layout.setContentsMargins(16, 14, 16, 14)
-        mapping_layout.setSpacing(8)
-        map_head = QHBoxLayout()
-        destination_icon = QLabel()
-        destination_icon.setPixmap(icon("arrow", "#7794cc", 19).pixmap(19))
-        map_head.addWidget(destination_icon)
-        self.remote_caption = label("手机镜像 · 上传发布的目标", "field")
-        self.remote_caption.setWordWrap(True)
-        map_head.addWidget(self.remote_caption, 1)
-        map_head.addStretch(1)
-        self.auto_badge = Badge("自动独立目录" if self._is_new else "任务独立目录", "blue")
-        map_head.addWidget(self.auto_badge)
-        self.remote_preview = label("", "mono")
-        self.history_preview = label("", "mono")
-        for preview in (self.remote_preview, self.history_preview):
-            preview.setWordWrap(True)
-            preview.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-            preview.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        mapping_layout.addLayout(map_head)
-        mapping_layout.addWidget(self.remote_preview)
-        mapping_layout.addWidget(self.history_preview)
-        layout.addWidget(mapping)
-
-        self.advanced_button = QToolButton()
-        self.advanced_button.setText("高级 · 手动修改镜像与历史目录")
-        self.advanced_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        self.advanced_button.setIcon(icon("chevron", "#8294b1", 16))
-        self.advanced_button.setCheckable(True)
-        self.advanced_button.setMinimumHeight(34)
-        self.advanced_button.toggled.connect(self._show_advanced)
-        layout.addWidget(self.advanced_button, 0, Qt.AlignmentFlag.AlignLeft)
-        self.advanced_widget = QWidget()
-        advanced = QVBoxLayout(self.advanced_widget)
-        advanced.setContentsMargins(0, 0, 0, 0)
-        advanced.setSpacing(13)
-        self.remote_edit = QLineEdit(self._draft.remote_path)
+        self.remote_edit = QLineEdit(self._draft.remote_path if not self._is_new else "")
         self.remote_edit.setObjectName("taskMirrorTarget")
-        self.versions_edit = QLineEdit(self._draft.versions_path)
-        self.versions_edit.setObjectName("taskHistoryTarget")
         self.remote_edit.textChanged.connect(self._targets_changed)
-        self.versions_edit.textChanged.connect(self._versions_changed)
-        remote_row = QWidget()
-        row_layout = QHBoxLayout(remote_row)
-        row_layout.setContentsMargins(0, 0, 0, 0)
-        row_layout.addWidget(self.remote_edit, 1)
-        self.browse_remote_button = button("浏览手机已有目录…", "secondary", "folder")
-        self.browse_remote_button.clicked.connect(self._browse_remote)
-        row_layout.addWidget(self.browse_remote_button)
-        self.remote_hint = label("NAS 根目录下的相对路径；不能与任何任务的镜像 / 历史目录重叠。", "small")
+        self.browse_remote_button = button("浏览手机…", "secondary", "folder")
+        self.browse_remote_button.setAccessibleName("选择手机镜像目录")
+        self.browse_remote_button.clicked.connect(lambda: self._browse_remote("mirror"))
+        self.remote_caption = label("", "field")
+        self.remote_caption.setWordWrap(True)
+        self.remote_caption.setBuddy(self.remote_edit)
+        layout.addWidget(self.remote_caption)
+        layout.addWidget(_browse_row(self.remote_edit, self.browse_remote_button))
+        self.remote_hint = label("", "small")
         self.remote_hint.setWordWrap(True)
-        advanced.addWidget(_field("手机镜像目录", remote_row))
-        advanced.addWidget(self.remote_hint)
-        advanced.addWidget(_field("手机历史目录（可编辑）", self.versions_edit, "上传发布或交回修改时，手机中被覆盖 / 删除的旧文件保留在这里。它不是完整时间点快照。"))
-        self.reset_button = button("恢复自动分配", "link", "restore")
-        self.reset_button.clicked.connect(self._reset_targets)
-        advanced.addWidget(self.reset_button, 0, Qt.AlignmentFlag.AlignLeft)
-        advanced.addWidget(_notice("更换用途、目录或排除范围后，需要重新查看差异。旧目录的镜像与历史不会自动移动或删除。"))
-        self.advanced_widget.setVisible(False)
-        layout.addWidget(self.advanced_widget)
+        layout.addWidget(self.remote_hint)
+
+        self.versions_edit = QLineEdit(self._draft.versions_path if not self._is_new else "")
+        self.versions_edit.setObjectName("taskHistoryTarget")
+        self.versions_edit.setPlaceholderText("NAS 根下的相对路径，例如 PhoneNasHistory/工作文件")
+        self.versions_edit.textChanged.connect(self._versions_changed)
+        self.browse_versions_button = button("浏览手机…", "secondary", "folder")
+        self.browse_versions_button.setAccessibleName("选择手机历史目录")
+        self.browse_versions_button.clicked.connect(lambda: self._browse_remote("history"))
+        layout.addWidget(_field("手机历史目录 · 手机上的旧文件", _browse_row(self.versions_edit, self.browse_versions_button),
+                                "上传或交回时，手机上被覆盖、删除的旧文件保存在这里。选归档根目录，不要选择某个日期批次。",
+                                buddy=self.versions_edit))
         self.local_history_edit = QLineEdit(self._draft.local_history_path)
         self.local_history_edit.setObjectName("taskLocalHistory")
-        self.local_history_edit.setPlaceholderText("自动建议数据目录之外的同级历史目录")
+        self.local_history_edit.setPlaceholderText("选择已有目录，或输入尚未创建的绝对路径")
         self.local_history_edit.textChanged.connect(self._local_history_changed)
-        layout.addWidget(_field("本地历史目录 · 数据目录之外", self.local_history_edit, "接收手机更新前，本地被覆盖 / 删除的旧文件留在这里。上传端主动接收手机更新时也会使用。必须为绝对路径，且与所有数据目录隔离。"))
+        self.browse_local_history_button = button("浏览电脑…", "secondary", "folder")
+        self.browse_local_history_button.setAccessibleName("选择本地历史目录")
+        self.browse_local_history_button.clicked.connect(self._browse_local_history)
+        layout.addWidget(_field("本地历史目录 · 电脑上的旧文件", _browse_row(self.local_history_edit, self.browse_local_history_button),
+                                "下载或接收更新时，本机被覆盖、删除的旧文件保存在这里。请放在工作目录之外。两种历史都不是完整快照。",
+                                buddy=self.local_history_edit))
+        self.reset_button = button("恢复建议的目录", "link", "restore")
+        self.reset_button.clicked.connect(self._reset_targets)
+        layout.addWidget(self.reset_button, 0, Qt.AlignmentFlag.AlignLeft)
         self.enabled_check = QCheckBox("启用此任务（允许手动执行）")
         self.enabled_check.setChecked(self._draft.enabled)
         layout.addWidget(self.enabled_check)
@@ -378,34 +360,68 @@ class TaskDialog(QDialog):
             if receive and not self._remote_explicit:
                 self._updating_targets = True
                 self.remote_edit.clear()
-                self.versions_edit.clear()
+                if not self._versions_manual:
+                    self.versions_edit.clear()
                 self._updating_targets = False
                 self._manual_targets = False
-                self._versions_manual = False
-        self.local_caption.setText("本地接收目录 · 下载接收" if receive else "本地来源目录 · 上传发布")
-        self.local_edit.setPlaceholderText("选择这台电脑上已有的接收目录（可为空目录）" if receive else "选择这台电脑上需要发布的来源目录")
-        self.local_hint.setText("手机镜像是来源；接收会更新此目录，原有文件可能被覆盖 / 删除。请选择已有目录，建议首次使用空目录。" if receive else "本地目录是来源，发布会更新手机镜像；主动接收手机更新需另外确认。")
-        self.remote_caption.setText("手机已有数据集镜像 · 下载接收的来源" if receive else "手机镜像 · 上传发布的目标")
-        self.remote_hint.setText("必须显式选择或填写手机上已有的数据集镜像相对路径；不会为下载接收自动创建空的随机目录。执行前会核对数据集标识与范围。" if receive else "NAS 根目录下的相对路径；不能与其他镜像 / 历史目录重叠。首次发布前会查看差异。")
-        self.advanced_button.setText("手机镜像与历史目录" if receive else "高级 · 手动修改手机镜像与历史目录")
-        self.advanced_button.setChecked(receive or not self._is_new or self._manual_targets)
-        self.reset_button.setVisible(self._is_new and not receive)
-        self.browse_remote_button.setEnabled(_operational(self))
-        self.subtitle.setText("手机上的当前镜像 → 这台电脑的接收目录。不会自动交回本地修改。" if receive else "这台电脑的来源目录 → 手机上的当前镜像。不是自动双向同步。")
+        self.local_caption.setText("本地工作目录 · 下载的目标" if receive else "本地工作目录 · 上传的来源")
+        self.local_edit.setPlaceholderText("首次接收建议选择空目录" if receive else "选择要上传的文件夹")
+        self.local_hint.setText("请用已有的本地文件夹。接收前会核对变动，避免覆盖本机未交回的修改。" if receive else "从这个文件夹读取要发布的文件。")
+        self.remote_caption.setText("手机镜像目录 · 下载的来源" if receive else "手机镜像目录 · 上传的目标")
+        self.remote_edit.setPlaceholderText("选择手机上已完成发布的镜像" if receive else "NAS 根下的相对路径，例如 PhoneNasBackup/工作文件")
+        self.reset_button.setVisible(self._is_new)
+        self._refresh_binding()
+        self.subtitle.setText("手机当前镜像 → 本地工作目录。交回修改需另行确认。" if receive else "本地工作目录 → 手机当前镜像。不是自动双向同步。")
+        self._suggest_name()
         self._update_auto_targets()
         self._update_mapping()
 
+    def _uses_saved_receive_scope(self) -> bool:
+        return (self._original is not None and self._original.direction == "download"
+                and self.remote_edit.text().strip() == self._original.remote_path)
+
+    def _refresh_binding(self) -> None:
+        receiving = self._purpose == "download"
+        connected = _operational(self)
+        attached = receiving and (self._published_scope is not None or self._uses_saved_receive_scope())
+        self.browse_remote_button.setEnabled(connected)
+        self.browse_versions_button.setEnabled(connected)
+        self.browse_versions_button.setText("查看手机…" if attached else "浏览手机…")
+        self.versions_edit.setReadOnly(attached)
+        self.preset_combo.setEnabled(not attached)
+        self.excludes_edit.setReadOnly(attached or self.preset_combo.currentData() != "custom")
+        if attached:
+            self.remote_hint.setText("手机历史与排除规则沿用发布方的设置。如需接收另一份镜像，请重新浏览。")
+        elif receiving:
+            self.remote_hint.setText("通过“浏览手机…”选定已发布的镜像；软件会自动读取它的历史路径与排除规则。")
+        else:
+            self.remote_hint.setText("手机上的当前文件，不是历史备份。可浏览已有目录，也可填尚未创建的相对路径。")
+
     def _browse(self) -> None:
-        caption = "选择这台电脑上的接收目录" if self.direction_combo.currentData() == "download" else "选择电脑上的来源文件夹"
+        caption = "选择电脑上的接收目录" if self._purpose == "download" else "选择电脑上的来源文件夹"
         folder = QFileDialog.getExistingDirectory(self, caption, self.local_edit.text())
         if folder:
-            self.local_edit.setText(folder)
+            self.local_edit.setText(os.path.normpath(folder))
 
-    def _browse_remote(self) -> None:
+    def _browse_local_history(self) -> None:
+        start = Path(self.local_history_edit.text() or self.local_edit.text()).expanduser()
+        while start.is_absolute() and start != start.parent and not start.is_dir():
+            start = start.parent
+        folder = QFileDialog.getExistingDirectory(self, "选择电脑上的历史目录（不是工作目录）", str(start),
+                                                  QFileDialog.Option.ShowDirsOnly | QFileDialog.Option.ReadOnly)
+        if folder:
+            self.local_history_edit.setText(os.path.normpath(folder))
+
+    def _browse_remote(self, purpose: str) -> None:
         if not _operational(self) or self._remote_dialog is not None:
             return
-        dialog = RemoteFolderDialog(self.config, self, operational=self.operational)
+        editor = self.versions_edit if purpose == "history" else self.remote_edit
+        dialog = RemoteFolderDialog(self.config, self, operational=self.operational,
+                                    purpose=purpose, current_path=editor.text(),
+                                    require_published=purpose == "mirror" and self._purpose == "download",
+                                    browse_only=editor.isReadOnly())
         self._remote_dialog = dialog
+        self._browse_purpose = purpose
         dialog.finished.connect(self._remote_selected)
         dialog.open()
 
@@ -415,43 +431,78 @@ class TaskDialog(QDialog):
         if dialog is None:
             return
         if result == QDialog.DialogCode.Accepted and dialog.remote_path:
-            self.remote_edit.setText(dialog.remote_path)
+            if self._browse_purpose == "history":
+                self.versions_edit.setText(dialog.remote_path)
+                self._versions_manual = True
+            else:
+                self.remote_edit.setText(dialog.remote_path)
+                if dialog.dataset is not None:
+                    self._apply_published_scope(dialog.dataset)
         dialog.deleteLater()
+
+    def _apply_published_scope(self, scope: dict) -> None:
+        self._published_scope = scope
+        self._versions_manual = True
+        self.versions_edit.setText(scope["versions_path"])
+        self._saved_rules = tuple(scope["excludes"])
+        self._saved_rule_preset = ("none" if not self._saved_rules else
+                                   "recommended" if self._saved_rules == tuple(C.RECOMMENDED_EXCLUDES) else "custom")
+        self._previous_preset = ""
+        self._custom_rules = "\n".join(self._saved_rules)
+        self._initial_custom_text = None
+        self.preset_combo.setCurrentIndex(self.preset_combo.findData(self._saved_rule_preset))
+        self._previous_preset = ""
+        self._preset_changed()
+        self._refresh_binding()
+        self.error_label.setVisible(False)
 
     def _name_changed(self, _text: str) -> None:
         self._name_edited = True
         self._update_auto_targets()
 
-    def _source_changed(self, text: str) -> None:
-        if self._loading:
+    def _suggest_name(self) -> None:
+        if not self._is_new or self._name_edited:
             return
-        if self._is_new and not self._name_edited:
-            self.name_edit.setText(ntpath.basename(text.rstrip("\\/")) or "")
-        polish(self.local_edit, invalid=False)
-        if not self._history_manual:
+        name = ntpath.basename(self.local_edit.text().rstrip("\\/"))
+        if self._purpose == "download" and self.remote_edit.text():
             try:
-                suggestion = replace(self._draft, local_path=text.strip(), local_history_path="")
-                self._updating_targets = True
-                self.local_history_edit.setText(suggestion.local_history_path)
+                remote = normalize_remote_path(self.remote_edit.text())
+                parent, _, leaf = remote.rpartition("/")
+                name = parent.rpartition("/")[2] if parent and leaf.casefold() == "mirror" else leaf
             except ValueError:
                 pass
-            finally:
-                self._updating_targets = False
+        self.name_edit.setText(name)
+
+    def _suggest_local_history(self) -> None:
+        if self._history_manual:
+            return
+        try:
+            suggestion = suggest_local_history(self.local_edit.text().strip(), self._draft.id)
+        except ValueError:
+            suggestion = ""
+        self._updating_targets = True
+        self.local_history_edit.setText(suggestion)
+        self._updating_targets = False
+
+    def _source_changed(self, _text: str) -> None:
+        if self._loading:
+            return
+        self._suggest_name()
+        polish(self.local_edit, invalid=False)
+        self._suggest_local_history()
         self._update_auto_targets()
         self._update_mapping()
 
     def _update_auto_targets(self) -> None:
-        if self._loading or self._manual_targets or self.direction_combo.currentData() == "download":
+        if self._loading or self._manual_targets or self._purpose == "download":
             return
-        suggestion = new_task(self.local_edit.text().strip(), self.name_edit.text().strip())
-        # Keep one ID for this draft even while its human-readable slug changes.
-        suffix = suggestion.id[:8]
+        name = self.name_edit.text().strip() or ntpath.basename(self.local_edit.text().rstrip("\\/"))
+        mirror, history = suggest_phone_paths(name, self._draft.id) if name else ("", "")
         self._updating_targets = True
-        self.remote_edit.setText(suggestion.remote_path.replace(suffix, self._draft.id[:8]))
+        self.remote_edit.setText(mirror)
         if not self._versions_manual:
-            self.versions_edit.setText(suggestion.versions_path.replace(suffix, self._draft.id[:8]))
+            self.versions_edit.setText(history)
         self._updating_targets = False
-        self.auto_badge.set_status("自动独立目录", "blue")
         self._update_mapping()
 
     def _targets_changed(self, _text: str) -> None:
@@ -459,17 +510,21 @@ class TaskDialog(QDialog):
             return
         self._manual_targets = True
         self._remote_explicit = bool(self.remote_edit.text().strip())
+        if self._published_scope is not None and self.remote_edit.text() != self._published_scope["remote_path"]:
+            self._published_scope = None
+            self._versions_manual = False
         if not self._versions_manual:
             remote = self.remote_edit.text().strip()
             try:
                 remote = normalize_remote_path(remote)
-                suggestion = new_task("", remote_path=remote).versions_path
+                suggestion = suggest_phone_history(remote)
             except ValueError:
                 suggestion = ""
             self._updating_targets = True
             self.versions_edit.setText(suggestion)
             self._updating_targets = False
-        self.auto_badge.set_status("显式指定目录", "amber")
+        self._suggest_name()
+        self._refresh_binding()
         self._update_mapping()
 
     def _versions_changed(self, _text: str) -> None:
@@ -481,36 +536,31 @@ class TaskDialog(QDialog):
     def _local_history_changed(self, _text: str) -> None:
         if not self._loading and not self._updating_targets:
             self._history_manual = True
+            self._update_mapping()
 
     def _reset_targets(self) -> None:
-        if self.direction_combo.currentData() == "download":
-            return
-        self._manual_targets = False
-        self._versions_manual = False
-        self._remote_explicit = False
-        self._update_auto_targets()
-
-    def _show_advanced(self, shown: bool) -> None:
-        self.advanced_widget.setVisible(shown)
-        self.advanced_button.setIcon(icon("down" if shown else "chevron", "#8294b1", 16))
+        self._history_manual = False
+        self._suggest_local_history()
+        if self._purpose == "upload":
+            self._published_scope = None
+            self._manual_targets = False
+            self._versions_manual = False
+            self._remote_explicit = False
+            self._update_auto_targets()
+        self._update_mapping()
 
     def _update_mapping(self) -> None:
-        remote = self.remote_edit.text().strip()
-        versions = self.versions_edit.text().strip()
-        self.remote_preview.setText("手机镜像   /" + remote if remote else "手机镜像   请显式选择已有数据集")
-        self.history_preview.setText("手机历史   /" + versions if versions else "手机历史   随镜像目录建议，可编辑")
-        if self.direction_combo.currentData() == "download":
-            self.auto_badge.set_status("已有数据集" if self._remote_explicit else "待选择", "blue" if self._remote_explicit else "amber")
-        if self._original is not None:
-            changed = (
-                self.local_edit.text().strip() != self._original.local_path
-                or self.remote_edit.text().strip() != self._original.remote_path
-                or self.versions_edit.text().strip() != self._original.versions_path
-                or self.direction_combo.currentData() != self._original.direction
-            )
-            message = "更换用途或目录后将重新查看差异；旧目录的文件不会移动或删除。" if changed else "保存只更新任务设置。执行前会查看差异并检查来源；保存不会改动任何数据文件。"
-            notice_label = self.target_warning.findChildren(QLabel)[-1]
-            notice_label.setText(message)
+        if self._original is None:
+            return
+        changed = (
+            self.local_edit.text().strip() != self._original.local_path
+            or self.remote_edit.text().strip() != self._original.remote_path
+            or self.versions_edit.text().strip() != self._original.versions_path
+            or self.local_history_edit.text().strip() != self._original.local_history_path
+            or self._purpose != self._original.direction
+        )
+        message = "改用新目录不会移动旧文件或历史；保存后请重新查看差异。" if changed else "保存只更新任务设置，不移动文件。查看差异是只读操作。"
+        self.target_warning.findChildren(QLabel)[-1].setText(message)
 
     def _preset_changed(self, *_args) -> None:
         if self._loading:
@@ -523,8 +573,9 @@ class TaskDialog(QDialog):
         self.rules_toggle.setVisible(preset == "recommended")
         self.excludes_edit.setReadOnly(preset != "custom")
         if preset == "recommended":
-            self.excludes_edit.setPlainText("\n".join(C.RECOMMENDED_EXCLUDES))
-            self.rules_summary.setText("跳过构建缓存、临时文件和系统缩略图。Release 目录会保留；仍会应用具体文件匹配规则。")
+            rules = self._saved_rules if self._saved_rule_preset == preset else C.RECOMMENDED_EXCLUDES
+            self.excludes_edit.setPlainText("\n".join(rules))
+            self.rules_summary.setText("按任务中的规则跳过构建缓存和临时文件。可展开核对具体规则。")
             self.excludes_edit.setVisible(self.rules_toggle.isChecked())
         elif preset == "none":
             self.excludes_edit.clear()
@@ -543,6 +594,8 @@ class TaskDialog(QDialog):
         self.rules_toggle.setIcon(icon("down" if shown else "chevron", "#8294b1", 16))
 
     def accept(self) -> None:
+        if self._remote_dialog is not None:
+            return
         name = self.name_edit.text().strip()
         local = self.local_edit.text().strip()
         direction = str(self.direction_combo.currentData())
@@ -553,16 +606,23 @@ class TaskDialog(QDialog):
         if direction == "download" and (not self._remote_explicit or not self.remote_edit.text().strip()):
             self._show_error("请显式选择或填写手机上已有的数据集镜像目录；下载接收不能使用自动创建的空目录。")
             self.tabs.setCurrentIndex(0)
-            self.advanced_button.setChecked(True)
             self.remote_edit.setFocus()
             return
+        if (direction == "download" and _operational(self) and self._published_scope is None
+                and not self._uses_saved_receive_scope()):
+            self.tabs.setCurrentIndex(0)
+            self._show_error("请通过“浏览手机…”核对并选择已经发布的镜像；不能根据手填路径猜测历史目录或排除规则。")
+            self.browse_remote_button.setFocus()
+            return
         preset = str(self.preset_combo.currentData())
-        if preset == "recommended":
-            patterns = tuple(C.RECOMMENDED_EXCLUDES)
-        elif preset == "custom":
+        if preset == "custom":
             text = self.excludes_edit.toPlainText()
-            patterns = (self._draft.excludes if text == self._initial_custom_text
+            patterns = (self._saved_rules if text == self._initial_custom_text
                         else tuple(line for line in text.split("\n") if line))
+        elif preset == self._saved_rule_preset:
+            patterns = self._saved_rules
+        elif preset == "recommended":
+            patterns = tuple(C.RECOMMENDED_EXCLUDES)
         else:
             patterns = ()
         drive = self.config.get("mount.drive", C.DEFAULT_DRIVE)
@@ -570,17 +630,28 @@ class TaskDialog(QDialog):
             remote = normalize_remote_path(self.remote_edit.text())
             versions = normalize_remote_path(self.versions_edit.text())
             history = self.local_history_edit.text().strip()
+            if not history:
+                raise ValueError("请选择或填写本地历史目录，不能留空。")
+            if self._original is None or history != self._original.local_history_path:
+                validate_local_history_path(history)
+            validate_history_inventory((), (remote, versions))
+            scope = self._published_scope if direction == "download" else None
+            if scope is not None and (scope["remote_path"] != remote or scope["versions_path"] != versions
+                                      or tuple(scope["excludes"]) != patterns):
+                raise ValueError("镜像、手机历史或排除规则与发布记录不一致，请重新选择已发布的镜像。")
+            if (direction == "download" and scope is None and self._uses_saved_receive_scope()
+                    and (versions != self._draft.versions_path or patterns != self._draft.excludes)):
+                raise ValueError("接收任务沿用已发布的手机历史和排除规则，不能在此改写。")
+            dataset_id = (scope["dataset_id"] if scope is not None else
+                          self._draft.dataset_id if remote == self._draft.remote_path else dataset_id_for_remote(remote))
             scope_changed = self._original is not None and (
                 direction != self._original.direction
                 or local != self._original.local_path
                 or remote != self._original.remote_path
                 or versions != self._original.versions_path
-                or history != self._original.local_history_path
                 or patterns != self._original.excludes
+                or dataset_id != self._original.dataset_id
             )
-            dataset_id = self._draft.dataset_id if remote == self._draft.remote_path else new_task(
-                local, name, direction=direction, remote_path=remote, versions_path=versions,
-            ).dataset_id
             candidate = replace(
                 self._draft,
                 name=name,
@@ -668,7 +739,7 @@ class _DirectoryPicker(QFileDialog):
 class MultiFolderDialog(QDialog):
     """Collect sources only; the owner creates and validates independent tasks."""
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, staging: bool = False):
         super().__init__(parent)
         self.folders: list[str] = []
         self._paths: list[str] = []
@@ -680,7 +751,8 @@ class MultiFolderDialog(QDialog):
         layout.setContentsMargins(25, 23, 25, 20)
         layout.setSpacing(16)
         layout.addWidget(label("一次添加多个文件夹", "dialogTitle"))
-        subtitle = label("每个文件夹将创建一个独立任务，并自动分配独立的镜像与历史目录。", "subtitle")
+        subtitle = label("所选目录先加入待添加清单，保存向导时才建立上传任务。" if staging else
+                         "每个文件夹建立一个仅手动的上传任务，并建议独立的镜像和历史目录。", "subtitle")
         subtitle.setWordWrap(True)
         layout.addWidget(subtitle)
         toolbar = QHBoxLayout()

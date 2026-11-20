@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from app.core.rclone import Result
 from app.core.tasks import MirrorTask
 from app.core.history import HistoryService
+from app.core.winpath import extended_path, remove_tree
 
 
 VERSION = "2026-11-14_153000"
@@ -89,6 +90,15 @@ class FakeRclone:
         ]), "", 0)
         self.copied = Result(True, "", "", 0)
         self.purged = Result(True, "", "", 0)
+        self.states: dict[str, Result] = {}
+
+    def set_dataset_state(self, task, *, phase="ready"):
+        self.states[f"phone:{task.dataset_control_path}/state.json"] = Result(True, json.dumps({
+            "version": 2, "phase": phase, "generation": "3d096a03-4ea0-4160-8eeb-bc2ee7425b15",
+            "dataset_id": task.dataset_id, "remote_path": task.remote_path,
+            "versions_path": task.versions_path, "excludes": list(task.excludes),
+            "content_digest": "a" * 64,
+        }), "", 0)
 
     def lsf_dirs(self, path):
         self.calls.append(("lsf_dirs", path))
@@ -100,7 +110,16 @@ class FakeRclone:
 
     def run(self, args, timeout=120):
         self.calls.append(("run", tuple(args), timeout))
-        if args[:1] == ["cat"] or "--stat" in args:
+        if args[:1] == ["cat"]:
+            return self.states.get(args[1], Result(False, "", "missing", 3))
+        if args[1] == "phone:.phonenas/datasets":
+            entries = [{"Path": path.split("/")[-2], "IsDir": True} for path in self.states]
+            return Result(True, json.dumps(entries), "", 0)
+        if "--stat" in args:
+            state = self.states.get(args[1])
+            if state is not None:
+                return Result(True, json.dumps({"Path": "state.json", "IsDir": False,
+                                                "Size": len(state.out.encode("utf-8"))}), "", 0)
             return Result(False, "", "missing", 3)
         return self.inventory
 
@@ -133,8 +152,11 @@ class HistoryServiceTests(unittest.TestCase):
         self.task = make_task(self.root / "source")
         self.client = FakeRclone()
         lease = patch("app.core.relay.DatasetCoordinator._new_lease", return_value=nullcontext())
-        lease.start()
+        self.new_lease = lease.start()
         self.addCleanup(lease.stop)
+        registration = patch("app.core.relay.DatasetCoordinator.registration_lease", side_effect=lambda *_: nullcontext())
+        registration.start()
+        self.addCleanup(registration.stop)
 
     def test_versions_only_show_strict_real_timestamps_from_selected_task(self):
         self.client.dirs = Result(
@@ -240,7 +262,51 @@ class HistoryServiceTests(unittest.TestCase):
         self.assertEqual(Path(copies[2][2]), second / "photos/image.jpg")
         self.assertFalse(any(call[0] == "copy" for call in self.client.calls))
 
+    def test_delete_refuses_unmarked_history_without_claiming_a_lease(self):
+        task = replace(self.task, versions_path="other-backups/archive")
+        service = HistoryService(self.client, task)
+        self.assertIn(VERSION, service.list_versions())
+        self.assertEqual(service.list_files(VERSION), ["notes.txt", "photos/image.jpg"])
+        with self.assertRaisesRegex(RuntimeError, "已发布"):
+            service.delete(VERSION)
+        self.new_lease.assert_not_called()
+        self.assertFalse(any(call[0] == "purge" for call in self.client.calls))
+
+    def test_delete_refuses_mismatched_or_unready_scope_without_claiming_a_lease(self):
+        other_root = replace(self.task, versions_path="other-backups/archive")
+        for task, phase, message in [
+            (other_root, "ready", "不匹配"),
+            (self.task, "publishing", "未完成发布"),
+            (self.task, "interrupted", "未完成发布"),
+        ]:
+            with self.subTest(task=task.versions_path, phase=phase):
+                self.client.set_dataset_state(self.task, phase=phase)
+                with self.assertRaisesRegex(RuntimeError, message):
+                    HistoryService(self.client, task).delete(VERSION)
+        self.new_lease.assert_not_called()
+        self.assertFalse(any(call[0] == "purge" for call in self.client.calls))
+
+    def test_delete_rechecks_state_after_claiming_the_lease(self):
+        from app.core.relay import LocalDatasetLease
+
+        self.client.set_dataset_state(self.task)
+        lock = LocalDatasetLease(self.root / "phone", self.task)
+
+        @contextmanager
+        def state_removed_during_acquisition():
+            with lock:
+                self.client.states.clear()
+                yield
+
+        self.new_lease.side_effect = state_removed_during_acquisition
+        with self.assertRaisesRegex(RuntimeError, "已发布"):
+            HistoryService(self.client, self.task).delete(VERSION)
+        self.new_lease.assert_called_once()
+        self.assertFalse(lock.path.exists())
+        self.assertFalse(any(call[0] == "purge" for call in self.client.calls))
+
     def test_delete_requires_fresh_membership_and_safe_inventory_before_purge(self):
+        self.client.set_dataset_state(self.task)
         service = HistoryService(self.client, self.task)
         self.client.dirs = Result(True, f"{OLDER}/\n", "", 0)
         with self.assertRaises(ValueError):
@@ -254,7 +320,18 @@ class HistoryServiceTests(unittest.TestCase):
         self.client.inventory = Result(True, '[]', "", 0)
         self.client.calls.clear()
         service.delete(VERSION)
-        self.assertEqual([call[0] for call in self.client.calls], ["lsf_dirs", "run", "run", "run", "run", "purge"])
+        self.new_lease.assert_called_once()
+        reads = [call[1] for call in self.client.calls if call[0] == "run"]
+        self.assertEqual(sum(call[0] == "cat" for call in reads), 2)
+        self.assertEqual(sum(call[1] == "phone:.phonenas/datasets" for call in reads), 2)
+        self.assertEqual(self.client.calls[-1], ("purge", f"backup/task-a/versions/{VERSION}"))
+
+    def test_delete_with_sync_engines_checked_protocol_does_not_check_state_or_take_a_lease(self):
+        from app.core.filenames import LITERAL
+
+        HistoryService(self.client, self.task, protocol=LITERAL).delete(VERSION)
+        self.new_lease.assert_not_called()
+        self.assertFalse(any(call[0] == "run" and call[1][0] == "cat" for call in self.client.calls))
         self.assertEqual(self.client.calls[-1], ("purge", f"backup/task-a/versions/{VERSION}"))
 
     def test_restore_validates_all_files_before_writes_and_reports_partial_failure(self):
@@ -362,6 +439,25 @@ class LocalHistoryServiceTests(unittest.TestCase):
             with self.subTest(version=version):
                 with self.assertRaises(ValueError):
                     self.service().list_files(version)
+
+    def test_local_history_list_restore_and_delete_support_deep_paths(self):
+        relative = "/".join(["d" * 32] * 5 + ["probe.txt"])
+        batch = self.history / VERSION
+        deep = batch.joinpath(*relative.split("/"))
+        self.history.mkdir()
+        Path(extended_path(deep.parent)).mkdir(parents=True, exist_ok=True)
+        Path(extended_path(deep)).write_bytes(b"old deep bytes")
+        self.assertGreater(len(str(deep)), 260)
+
+        service = self.service()
+        self.assertEqual(service.list_files(VERSION), [relative])
+        destination = self.root / "restore"
+        destination.mkdir()
+        restored = service.restore(VERSION, destination, [relative])
+        self.addCleanup(remove_tree, restored)
+        self.assertEqual(Path(extended_path(restored / relative)).read_bytes(), b"old deep bytes")
+        service.delete(VERSION)
+        self.assertFalse(batch.exists())
 
     def test_restore_copies_old_bytes_into_a_new_exclusive_child_and_never_overwrites(self):
         batch = self.history / VERSION
@@ -795,6 +891,9 @@ class VersionsPageTests(unittest.TestCase):
         lease = patch("app.core.relay.DatasetCoordinator._new_lease", return_value=nullcontext())
         lease.start()
         self.addCleanup(lease.stop)
+        registration = patch("app.core.relay.DatasetCoordinator.registration_lease", side_effect=lambda *_: nullcontext())
+        registration.start()
+        self.addCleanup(registration.stop)
         self.config = MemoryConfig([
             make_task(root / "a"),
             make_task(root / "b", id="task-b", name="照片", remote_path="backup/task-b/mirror", versions_path="backup/task-b/versions"),
@@ -897,6 +996,7 @@ class VersionsPageTests(unittest.TestCase):
         clients = []
         def factory(config, conf_path=None):
             client = FakeWorkerRclone(config, conf_path)
+            client.set_dataset_state(config.get_task("task-b"))
             client.released.set()
             clients.append(client)
             return client
