@@ -41,6 +41,6 @@ On 2026-11-15, an authorized ordinary USB install succeeded on vivo V2227A / And
 - Race-detector run was unavailable because the host Go environment lacks cgo C compiler support; not reported as passing.
 - Root confinement is not a directory snapshot or a transaction against arbitrary external apps editing within a shared root. Local filesystem writers remain trusted. No content cache or hash extension exists yet.
 - POSIX rename durability after power loss, arbitrary recursive directory transactions and multi-user ACLs are not claimed. Typed collection replacement is refused rather than destructively emulated.
-- Coarse serialization favors simple correctness over peak performance in this debug build; there is no measured speed improvement claim.
+- Version 0.4.3 keeps writes ordered, but lets reads and listings finish while PUT stages and syncs its body. The commit still waits for active readers; this is not parallel write support or an end-to-end throughput guarantee. Conditional PUT publishes without replacement (Android `renameat2` with `RENAME_NOREPLACE`; host tests use a same-directory hard link). An unsupported filesystem fails closed.
 
 See the [Android build guide](../README.md) for the toolchain. Historical raw device reports stay local. Upstream license text is included in the Android APK's `assets/OPEN_SOURCE_NOTICES.txt`.

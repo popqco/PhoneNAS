@@ -40,7 +40,8 @@ type export struct {
 }
 
 type Engine struct {
-	mu        sync.Mutex
+	writers   sync.Mutex   // Writes stay ordered, even while a PUT is staging.
+	mu        sync.RWMutex // Protect the namespace and root lifetime during reads and commits.
 	roots     map[string]*export
 	user      [32]byte
 	password  [32]byte
@@ -131,6 +132,8 @@ func overlaps(a, b string) bool {
 
 // Close releases root descriptors. Shut down the HTTP server before calling it.
 func (e *Engine) Close() error {
+	e.writers.Lock()
+	defer e.writers.Unlock()
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.closed = true
@@ -169,8 +172,21 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		r.Body.Close()
 		r.Body = io.NopCloser(bytes.NewReader(body))
 	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	switch r.Method {
+	case "GET", "HEAD", "PROPFIND", "OPTIONS":
+		e.mu.RLock()
+		defer e.mu.RUnlock()
+	case "PUT":
+		// Staging changes only an unexported file. Keep writers serialized but
+		// let readers see the last committed state until the short publish step.
+		e.writers.Lock()
+		defer e.writers.Unlock()
+	default:
+		e.writers.Lock()
+		defer e.writers.Unlock()
+		e.mu.Lock()
+		defer e.mu.Unlock()
+	}
 	if r.Context().Err() != nil {
 		fail(w, http.StatusBadRequest)
 		return

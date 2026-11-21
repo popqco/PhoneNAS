@@ -201,7 +201,12 @@ func (e *Engine) put(w http.ResponseWriter, r *http.Request, x *export, rel stri
 		fail(w, http.StatusConflict)
 		return
 	}
-	if err := parentOK(x, rel); err != nil {
+	parentPath := path.Dir(rel)
+	parentInfo, err := x.check(parentPath)
+	if err != nil || !parentInfo.IsDir() {
+		if err == nil {
+			err = syscall.ENOTDIR
+		}
 		fail(w, filesystemStatus(err, http.StatusConflict))
 		return
 	}
@@ -210,7 +215,8 @@ func (e *Engine) put(w http.ResponseWriter, r *http.Request, x *export, rel stri
 		fail(w, http.StatusPreconditionFailed)
 		return
 	}
-	if exists && r.Header.Get("If-None-Match") == "*" {
+	createOnly := r.Header.Get("If-None-Match") == "*"
+	if exists && createOnly {
 		fail(w, http.StatusPreconditionFailed)
 		return
 	}
@@ -218,14 +224,24 @@ func (e *Engine) put(w http.ResponseWriter, r *http.Request, x *export, rel stri
 		fail(w, http.StatusRequestEntityTooLarge)
 		return
 	}
-	tmp := path.Join(path.Dir(rel), tempPrefix+rand.Text())
-	file, err := x.root.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	parent, err := x.root.OpenRoot(parentPath)
 	if err != nil {
 		fail(w, filesystemStatus(err, http.StatusConflict))
 		return
 	}
-	// The only temp we remove is the exact name successfully created above.
-	defer func() { _ = file.Close(); _ = x.root.Remove(tmp) }()
+	defer parent.Close()
+	if opened, err := parent.Stat("."); err != nil || !os.SameFile(opened, parentInfo) {
+		fail(w, http.StatusConflict)
+		return
+	}
+	// Pin the parent directory for staging and cleanup, even if a local app moves it.
+	tmp, name := tempPrefix+rand.Text(), path.Base(rel)
+	file, err := parent.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		fail(w, filesystemStatus(err, http.StatusConflict))
+		return
+	}
+	defer func() { _ = file.Close(); _ = parent.Remove(tmp) }()
 	n, err := io.CopyBuffer(file, io.LimitReader(r.Body, e.maxUpload+1), make([]byte, 128<<10))
 	if err != nil {
 		status := http.StatusBadRequest // interrupted/truncated request body
@@ -251,12 +267,28 @@ func (e *Engine) put(w http.ResponseWriter, r *http.Request, x *export, rel stri
 		fail(w, filesystemStatus(err, http.StatusConflict))
 		return
 	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	if r.Context().Err() != nil {
 		fail(w, http.StatusBadRequest)
 		return
 	}
-	if err := parentOK(x, rel); err != nil {
-		fail(w, filesystemStatus(err, http.StatusConflict))
+	if currentParent, err := x.check(parentPath); err != nil || !os.SameFile(parentInfo, currentParent) {
+		fail(w, http.StatusConflict)
+		return
+	}
+	if createOnly {
+		// A local writer does not take our locks. The filesystem operation, not
+		// a final existence check, must refuse to replace their destination.
+		if err := publishNew(parent, tmp, name); err != nil {
+			if errors.Is(err, os.ErrExist) {
+				fail(w, http.StatusPreconditionFailed)
+			} else {
+				fail(w, filesystemStatus(err, http.StatusConflict))
+			}
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
 		return
 	}
 	current, err := x.check(rel)
@@ -269,7 +301,7 @@ func (e *Engine) put(w http.ResponseWriter, r *http.Request, x *export, rel stri
 		fail(w, http.StatusConflict)
 		return
 	}
-	if err := x.root.Rename(tmp, rel); err != nil {
+	if err := parent.Rename(tmp, name); err != nil {
 		fail(w, filesystemStatus(err, http.StatusConflict))
 		return
 	}
