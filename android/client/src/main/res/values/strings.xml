@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">PhoneNAS 云盘</string>
+    <string name="cloud_files">文件</string>
+    <string name="cloud_connection">连接</string>
+    <string name="cloud_connect">连接云盘</string>
+    <string name="cloud_all_shares">全部共享</string>
+    <string name="cloud_back">返回</string>
+    <string name="cloud_refresh">刷新</string>
+    <string name="cloud_upload">上传文件</string>
+    <string name="cloud_show_password">显示密码</string>
+    <string name="cloud_hide_password">隐藏密码</string>
+</resources>

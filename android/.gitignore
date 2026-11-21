@@ -1,0 +1,17 @@
+/.gradle/
+/.kotlin/
+**/build/
+/local.properties
+*.jks
+*.keystore
+/app/libs/*.aar
+/app/libs/*.jar
+/validation/
+/davcore/evidence-*.json
+*.apk
+*.aab
+*.pem
+*.key
+*.p12
+*.pfx
+*.private.json

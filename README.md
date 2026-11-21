@@ -20,9 +20,9 @@ Windows 10/11 x64 · Python + PySide6 · rclone · WinFsp · 无广告
 
 ## Android 手机端：独立候选，未包含在本次发布
 
-手机端 `com.phonenas.server.probe` 0.4.2 候选版已在本台 vivo 完成插电熄屏 72 小时试运行（实际约 73 小时 12 分，正常停止，运行记录无故障或观测空白），但不代表全程远端持续可达或正式发行。该手机端与本次桌面 1.2.3 发布相互独立，相关源码、安装包和验收记录暂未纳入本仓库。
-
-下面仍是现有 Windows 客户端的使用说明；新增规划不改变其连接、同步规则或已有数据。
+- **存放文件的手机**使用独立的 [Android 文件服务端](docs/ANDROID-USER-GUIDE.md)，配置明确授权的普通共享。0.4.2 候选在一台 vivo 上完成约 73 小时 12 分的插电熄屏试运行，不代表持续远端可达。
+- **访问文件的手机**使用独立的 [Android 云盘客户端](docs/ANDROID-CLOUD-CLIENT.md)。它支持核对证书的 Tailscale HTTPS、浏览、下载和指定共享上传，不启动服务，不提供后台双向同步，也不明文连接旧 WsgiDAV。
+- 本分支提供[源码与构建说明](android/README.md)及[验收边界](docs/ANDROID-ACCEPTANCE.md)，不上传 APK、签名材料或设备原始记录。两款应用都不是桌面 1.2.3 的一部分。
 
 ## 本机手动上传与下载
 
