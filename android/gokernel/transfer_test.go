@@ -4,9 +4,11 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -126,6 +128,56 @@ func TestSlowPUTLeavesCommittedFilesAndListingAvailable(t *testing.T) {
 	if got := expectStatus(t, f.server, "GET", "/dataset/existing.txt", http.StatusOK); string(got) != "new complete bytes" {
 		t.Fatal("committed bytes differ")
 	}
+}
+
+func TestExpiredPUTCannotPublishAfterWaitingForAReader(t *testing.T) {
+	f := newFixture(t)
+	if err := os.WriteFile(filepath.Join(f.root, "old"), []byte("existing"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	entered, release, readDone := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	reader := &pausedResponse{ResponseRecorder: httptest.NewRecorder(), entered: entered, resume: release}
+	get := httptest.NewRequest("GET", "/dataset/old", nil)
+	get.SetBasicAuth("owner", password)
+	go func() { defer close(readDone); f.engine.ServeHTTP(reader, get) }()
+	unblock := sync.OnceFunc(func() { close(release); <-readDone })
+	defer unblock()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("reader did not start writing")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	put := httptest.NewRequest("PUT", "/dataset/new", strings.NewReader("complete body")).WithContext(ctx)
+	put.SetBasicAuth("owner", password)
+	writer := httptest.NewRecorder()
+	putDone := make(chan struct{})
+	go func() { defer close(putDone); f.engine.ServeHTTP(writer, put) }()
+	<-ctx.Done()
+	unblock()
+	select {
+	case <-putDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expired upload did not return")
+	}
+	if writer.Code != http.StatusBadRequest {
+		t.Fatalf("expired PUT returned %d", writer.Code)
+	}
+	if _, err := os.Stat(filepath.Join(f.root, "new")); !os.IsNotExist(err) {
+		t.Fatal("expired PUT published a file")
+	}
+}
+
+type pausedResponse struct {
+	*httptest.ResponseRecorder
+	entered, resume chan struct{}
+}
+
+func (w *pausedResponse) Write(p []byte) (int, error) {
+	close(w.entered)
+	<-w.resume
+	return w.ResponseRecorder.Write(p)
 }
 
 func TestConditionalPUTPreservesNameCreatedByLocalWriter(t *testing.T) {

@@ -291,7 +291,7 @@ func (e *Engine) put(w http.ResponseWriter, r *http.Request, x *export, rel stri
 		w.WriteHeader(http.StatusCreated)
 		return
 	}
-	current, err := x.check(rel)
+	current, err := parent.Lstat(name)
 	if exists {
 		if err != nil || !current.Mode().IsRegular() || !os.SameFile(info, current) {
 			fail(w, http.StatusConflict)

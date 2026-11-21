@@ -40,7 +40,7 @@ type Server struct {
 	address       string
 	remoteAddress string
 	remoteAllowed atomic.Bool
-	remoteContext context.Context
+	cancelLocal   context.CancelFunc
 	cancelRemote  context.CancelFunc
 	remoteOnce    sync.Once
 	active        sync.RWMutex
@@ -61,6 +61,7 @@ func Start(configurationJSON string) (*Server, error) {
 // start accepts a socket boundary so tests can run real TLS without changing
 // interface addresses. The exported production entry point always uses net.Listen.
 func start(configurationJSON string, listen func(string, string) (net.Listener, error)) (*Server, error) {
+	const requestTimeout = 120 * time.Second
 	if len(configurationJSON) > 65536 {
 		return nil, errors.New("configuration exceeds the debug safety limit")
 	}
@@ -117,11 +118,14 @@ func start(configurationJSON string, listen func(string, string) (net.Listener, 
 		}
 	}
 	s := &Server{engine: engine, identity: identity, address: listener.Addr().String(), remoteAddress: config.RemoteListen}
+	localContext, cancelLocal := context.WithCancel(context.Background())
+	s.cancelLocal = cancelLocal
 	limit := make(chan struct{}, 16)
 	s.server = &http.Server{
 		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       120 * time.Second,
-		WriteTimeout:      120 * time.Second,
+		ReadTimeout:       requestTimeout,
+		WriteTimeout:      requestTimeout,
+		BaseContext:       func(net.Listener) context.Context { return localContext },
 		IdleTimeout:       30 * time.Second,
 		MaxHeaderBytes:    16384,
 		ErrorLog:          log.New(io.Discard, "", 0),
@@ -139,6 +143,13 @@ func start(configurationJSON string, listen func(string, string) (net.Listener, 
 				http.Error(w, "busy", http.StatusServiceUnavailable)
 				return
 			}
+			// A socket write deadline does not cancel Request.Context by itself.
+			// Use the same budget for the response and the engine commit decision.
+			deadline := time.Now().Add(requestTimeout)
+			_ = http.NewResponseController(w).SetWriteDeadline(deadline)
+			ctx, cancel := context.WithDeadline(r.Context(), deadline)
+			defer cancel()
+			r = r.WithContext(ctx)
 			s.requests.Add(1)
 			r.Body = &countedBody{ReadCloser: r.Body, count: &s.received}
 			response := &countedResponse{ResponseWriter: w, count: &s.sent, request: r}
@@ -150,16 +161,17 @@ func start(configurationJSON string, listen func(string, string) (net.Listener, 
 		}),
 	}
 	if remoteListener != nil {
-		s.remoteContext, s.cancelRemote = context.WithCancel(context.Background())
+		remoteContext, cancelRemote := context.WithCancel(context.Background())
+		s.cancelRemote = cancelRemote
 		s.remoteAllowed.Store(true)
 		s.remote = &http.Server{
 			ReadHeaderTimeout: 10 * time.Second,
-			ReadTimeout:       120 * time.Second,
-			WriteTimeout:      120 * time.Second,
+			ReadTimeout:       requestTimeout,
+			WriteTimeout:      requestTimeout,
 			IdleTimeout:       30 * time.Second,
 			MaxHeaderBytes:    16384,
 			ErrorLog:          log.New(io.Discard, "", 0),
-			BaseContext:       func(net.Listener) context.Context { return s.remoteContext },
+			BaseContext:       func(net.Listener) context.Context { return remoteContext },
 			Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if !s.remoteAllowed.Load() {
 					http.Error(w, "remote access is disabled", http.StatusServiceUnavailable)
@@ -248,6 +260,12 @@ func (s *Server) RevokeRemote() {
 func (s *Server) Stop() {
 	s.stopOnce.Do(func() {
 		s.stopping.Store(true)
+		// Cancel both contexts before draining or closing individual sockets.
+		// An earlier handler freeing the writer lock must not admit another write.
+		s.cancelLocal()
+		if s.cancelRemote != nil {
+			s.cancelRemote()
+		}
 		s.running.Store(false)
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()

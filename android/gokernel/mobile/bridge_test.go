@@ -126,7 +126,25 @@ func TestStopCancelsQueuedMKCOLWithoutPublishingPartialPUT(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	server.Stop()
+	stopDone := make(chan struct{})
+	go func() { server.Stop(); close(stopDone) }()
+	// Complete the body while Stop is draining, before the socket is forcibly
+	// closed. Neither this upload nor the already queued mutation may commit.
+	deadline = time.Now().Add(2 * time.Second)
+	for server.running.Load() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if server.running.Load() {
+		t.Fatal("Stop did not start")
+	}
+	if _, err := io.WriteString(connection, strings.Repeat("x", 995)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-stopDone:
+	case <-time.After(7 * time.Second):
+		t.Fatal("Stop did not drain")
+	}
 	for _, name := range []string{"partial", "should-not-exist"} {
 		if _, err := os.Stat(filepath.Join(shared, name)); !os.IsNotExist(err) {
 			t.Fatalf("Stop left an uncommitted resource %s: %v", name, err)
