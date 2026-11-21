@@ -90,7 +90,11 @@ class Rclone:
             private_conf.touch(exist_ok=False)  # No credentials or persisted remote settings.
             command = [str(exe), *args, "--config", str(private_conf), "--ca-cert", str(ca),
                        "--no-check-certificate=false", "--allow-https-downgrade=false", "--webdav-auth-redirect=false"]
-            return command, env, support, (password, auth)
+            if args and args[0] == "mount":
+                # Never replay cached writes on a different paired endpoint.
+                identity = "\0".join((trust.authority, user, trust.fingerprint)).encode("utf-8")
+                command.extend(("--cache-dir", str(data_dir() / "paired-vfs" / hashlib.sha256(identity).hexdigest())))
+            return command, env, support, (auth, password)
         except BaseException:
             support.cleanup()
             raise

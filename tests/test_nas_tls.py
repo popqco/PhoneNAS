@@ -175,6 +175,33 @@ class NasTLSTests(unittest.TestCase):
         self.assertTrue(any(method == "DELETE" for method, *_ in seen))
         self.assertFalse((self.root / "rclone.conf").exists(), "pinned auth wrote a shared rclone profile")
 
+    def test_mount_cache_survives_same_identity_but_is_not_reused_after_repair(self):
+        self.require_rclone()
+        url = "https://127.0.0.1:18889"
+        new_leaf = make_leaf(self.root, label="repaired")
+        client = self.client(url)
+
+        def launch_cache():
+            with patch("app.core.rclone.data_dir", return_value=self.root), patch(
+                "app.core.rclone.subprocess.Popen"
+            ) as launch:
+                process = client.popen(["mount", "phone:", "W:", "--vfs-cache-mode", "writes"])
+                try:
+                    arguments = launch.call_args.args[0]
+                    return Path(arguments[arguments.index("--cache-dir") + 1])
+                finally:
+                    client.release(process)
+
+        cache = launch_cache()
+        self.assertEqual(cache.parent, self.root / "paired-vfs")
+        cache.mkdir(parents=True)
+        (cache / "old-queued-write").write_bytes(b"keep isolated")
+        self.assertEqual(launch_cache(), cache)
+        client.config.set("nas.tls_certificate", new_leaf[2])
+        client.config.set("nas.tls_fingerprint", new_leaf[3])
+        self.assertNotEqual(launch_cache(), cache)
+        self.assertEqual((cache / "old-queued-write").read_bytes(), b"keep isolated")
+
     def test_replace_leaf_rejects_before_any_http_on_both_clients(self):
         self.require_rclone()
         changed = make_leaf(self.root, label="replacement")
