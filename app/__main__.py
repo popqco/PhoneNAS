@@ -83,7 +83,7 @@ def main() -> int:
         from dataclasses import replace
         from app.core.tasks import new_task
 
-        folders = [Path(scratch.name) / name for name in ("LefeetHardware", "产品文档", "设计素材")]
+        folders = [Path(scratch.name) / name for name in ("项目资料", "产品文档", "设计素材")]
         for folder in folders:
             folder.mkdir()
         config.replace_tasks([

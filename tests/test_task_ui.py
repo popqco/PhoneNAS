@@ -397,6 +397,33 @@ class TaskUiTests(unittest.TestCase):
         self.assertFalse(blocked.execute_button.isEnabled())
         self.assertEqual(blocked.result(), QDialog.DialogCode.Rejected)
 
+    def test_settings_imports_phone_certificate_without_reusing_a_password_for_a_new_pin(self):
+        from test_nas_tls import make_leaf
+        from app.ui.pages.settings import SettingsPage
+
+        leaf = make_leaf(self.base)
+        page = self.keep(SettingsPage(self.config))
+        page.url_edit.setText("https://127.0.0.1:18889")
+        page.user_edit.setText("fixture")
+        form = page.phone_certificate
+        form.enabled_check.setChecked(True)
+        with patch("app.ui.pages.settings.QFileDialog.getOpenFileName", return_value=(str(leaf[0]), "")), patch(
+            "app.ui.pages.settings.set_autostart", return_value=(True, ""),
+        ):
+            form.pick.click()
+            form.fingerprint.setText(leaf[3])
+            page.save_button.click()
+            self.wait_for(lambda: not page.busy)
+            self.assertIn("重新输入密码", page.notice_label.text())
+            self.assertFalse(self.config.path.exists())
+            page.pass_edit.setText("synthetic-password-for-ui-only")
+            page.save_button.click()
+            self.wait_for(lambda: not page.busy)
+            self.assertEqual(self.config.nas_trust().fingerprint, leaf[3])
+            self.assertEqual(self.config.get("version"), 4)
+            self.assertEqual(page.pass_edit.text(), "")
+            self.assertTrue(form.enabled_check.isChecked())
+
     def test_wizard_is_inert_on_open_and_receive_choice_saves_connection_without_empty_upload_tasks(self):
         from app.ui.wizard import WizardDialog
 

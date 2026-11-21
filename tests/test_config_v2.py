@@ -48,6 +48,18 @@ class ConfigV3Tests(unittest.TestCase):
             path.write_text('{"version":3,"mount":{"read_only":"yes"}}', encoding="utf-8")
             self.assertTrue(Config(path).load_error)
 
+    def test_legacy_profile_without_chosen_address_or_source_does_not_invent_them(self) -> None:
+        path = data_dir() / "legacy-empty.json"
+        path.write_text('{"version":1,"mirror":{"enabled":false,"note":"keep"}}', encoding="utf-8")
+        config = Config(path)
+        self.assertEqual(config.load_error, "")
+        self.assertEqual(config.url, "")
+        self.assertEqual(config.tasks, ())
+        self.assertEqual(config.get("mirror.note"), "keep")
+        self.assertFalse(config.get("mirror.enabled"))
+        config.save()
+        self.assertEqual(Config(path).tasks, ())
+
     def test_v3_auto_sync_defaults_for_old_tasks_and_roundtrips_manual_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

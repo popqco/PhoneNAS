@@ -433,6 +433,7 @@ class SyncEngine:
             self.task.id, self.task.sync_identity, self.task.dataset_id, self.operation,
             local.digest, remote.digest, generation, missing,
             baseline[0].digest if baseline else None, baseline[1] if baseline else None,
+            store.binding.get("tls_fingerprint", ""),
         ], ensure_ascii=False).encode("utf-8")).hexdigest()
         report = SyncReport(
             added=sum(mark == "+" for mark in marks.values()),
@@ -628,10 +629,11 @@ class SyncEngine:
                 "--use-json-log", "--log-level", "INFO", "--retries", "1",
                 "--timeout", "60s", "--contimeout", "15s", "--low-level-retries", "2"]
         proc = self.rclone.popen(args)
+        paired = Rclone.paired_process(proc)
         log_handle = None
         succeeded = False
         try:
-            if self.log_directory is not None:
+            if self.log_directory is not None and not paired:
                 self.log_directory.mkdir(parents=True, exist_ok=True)
                 log_handle = (self.log_directory / f"sync-{datetime.now():%Y%m%d}.log").open("a", encoding="utf-8")
             if proc.stdout is None:
@@ -654,7 +656,8 @@ class SyncEngine:
             if self.cancelled.is_set():
                 raise RuntimeError("操作已取消；已完成的传输不回滚，未清理历史文件。")
             if code:
-                raise RuntimeError(f"传输退出码 {code}；请查看运行日志。未清理历史文件。")
+                detail = "请检查手机服务、证书和连接。" if paired else "请查看运行日志。"
+                raise RuntimeError(f"传输退出码 {code}；{detail}未清理历史文件。")
             succeeded = True
         finally:
             if succeeded:

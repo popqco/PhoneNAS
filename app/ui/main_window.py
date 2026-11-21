@@ -603,7 +603,8 @@ class MainWindow(QMainWindow):
 
     def _connection_settings(self) -> tuple:
         return tuple(self.config.get(key) for key in (
-            "nas.url", "nas.username", "nas.password_enc", "mount.drive", "mount.network_mode", "mount.enabled", "mount.read_only",
+            "nas.url", "nas.username", "nas.password_enc", "nas.tls_fingerprint",
+            "mount.drive", "mount.network_mode", "mount.enabled", "mount.read_only",
         ))
 
     def _on_settings_saved(self) -> None:

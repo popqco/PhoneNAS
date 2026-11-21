@@ -32,6 +32,7 @@ from app.ui.pages.settings import (
     _ConnectionInput,
     _ConnectionResult,
     _OperationThread,
+    _PhoneCertificateFields,
     _card,
     _feedback,
     _field,
@@ -154,6 +155,9 @@ class WizardDialog(QDialog, _AsyncOperations):
         credentials.addLayout(_field("用户名", self.user_edit), 1)
         credentials.addLayout(_field("密码", self.pass_edit), 1)
         connection_layout.addLayout(credentials)
+        self.phone_certificate = _PhoneCertificateFields()
+        self.phone_certificate.load(config)
+        connection_layout.addWidget(self.phone_certificate)
         test_row = QHBoxLayout()
         self.test_button = button("测试连接", glyph="link")
         self.test_label = label("尚未测试当前输入", "muted")
@@ -280,7 +284,7 @@ class WizardDialog(QDialog, _AsyncOperations):
         root.addLayout(actions)
 
         self._editors = (
-            self.url_edit, self.user_edit, self.pass_edit, self.drive_combo,
+            self.url_edit, self.user_edit, self.pass_edit, self.phone_certificate, self.drive_combo,
             self.mount_check, self.auto_mount_check, self.autostart_check,
             self.direction_combo, self.folder_list, self.interval_spin, self.retention_spin,
             self.preset_combo, self.enable_tasks_check, self.auto_sync_check,
@@ -298,6 +302,7 @@ class WizardDialog(QDialog, _AsyncOperations):
         self.folder_list.currentRowChanged.connect(self._refresh_controls)
         for edit in (self.url_edit, self.user_edit, self.pass_edit):
             edit.textChanged.connect(self._connection_edited)
+        self.phone_certificate.changed.connect(self._connection_edited)
         for signal in (self.interval_spin.valueChanged, self.retention_spin.valueChanged, self.preset_combo.currentIndexChanged):
             signal.connect(self._refresh_folders)
         self._refresh_folders()
@@ -320,10 +325,10 @@ class WizardDialog(QDialog, _AsyncOperations):
         super()._operation_ended()
 
     def _connection_input(self) -> _ConnectionInput:
-        return _ConnectionInput(
+        return self.phone_certificate.apply_to(_ConnectionInput(
             self.url_edit.text().strip().rstrip("/"),
             self.user_edit.text().strip(), self.pass_edit.text(),
-        )
+        ))
 
     def _connection_edited(self) -> None:
         if not self.busy:

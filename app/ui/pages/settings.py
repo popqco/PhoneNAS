@@ -27,6 +27,7 @@ from app import constants as C
 from app.core import winfsp
 from app.core.autostart import set_autostart
 from app.core.config import Config
+from app.core.nas_tls import read_nas_trust
 from app.core.rclone import Rclone
 from app.core.tasks import validate_tasks
 from app.ui.widgets import Card, button, label
@@ -37,6 +38,9 @@ class _ConnectionInput:
     url: str
     username: str
     password: str
+    certificate: str = ""
+    fingerprint: str = ""
+    use_phone_certificate: bool = False
 
 
 @dataclass(frozen=True)
@@ -198,6 +202,76 @@ def _scroll(content: QWidget) -> QScrollArea:
     return scroll
 
 
+class _PhoneCertificateFields(QWidget):
+    changed = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pem = ""
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.enabled_check = QCheckBox("使用 PhoneNAS 手机端的专用 HTTPS 证书")
+        self.enabled_check.setObjectName("nasUsePhoneCertificate")
+        layout.addWidget(self.enabled_check)
+        self.fields = QWidget()
+        form = QVBoxLayout(self.fields)
+        form.setContentsMargins(0, 0, 0, 0)
+        hint = label("导入手机服务端导出的公开 PEM，并与手机页面独立核对 SHA-256 指纹。不会安装到系统信任。", "small")
+        hint.setWordWrap(True)
+        form.addWidget(hint)
+        row = QHBoxLayout()
+        self.pick = button("导入公开证书", "subtle")
+        self.pick.setObjectName("nasImportPublicCertificate")
+        self.status = label("尚未导入", "small")
+        self.status.setWordWrap(True)
+        row.addWidget(self.pick)
+        row.addWidget(self.status, 1)
+        form.addLayout(row)
+        self.fingerprint = QLineEdit()
+        self.fingerprint.setObjectName("nasCertificateSha256")
+        self.fingerprint.setMaxLength(100)
+        form.addLayout(_field("SHA-256 指纹", self.fingerprint))
+        layout.addWidget(self.fields)
+        self.fields.setVisible(False)
+        self.enabled_check.toggled.connect(self.fields.setVisible)
+        self.enabled_check.toggled.connect(self.changed)
+        self.fingerprint.textChanged.connect(self.changed)
+        self.pick.clicked.connect(self._pick)
+
+    def load(self, config: Config) -> None:
+        self._pem = config.get("nas.tls_certificate", "")
+        self.fingerprint.setText(config.get("nas.tls_fingerprint", ""))
+        self.status.setText("已导入公开证书" if self._pem else "尚未导入")
+        self.enabled_check.setChecked(config.get("version") == 4)
+
+    def apply_to(self, request: _ConnectionInput) -> _ConnectionInput:
+        if not self.enabled_check.isChecked():
+            return request
+        return replace(request, certificate=self._pem, fingerprint=self.fingerprint.text(), use_phone_certificate=True)
+
+    def _pick(self) -> None:
+        if not _operational(self):
+            return
+        name, _ = QFileDialog.getOpenFileName(self, "导入 PhoneNAS 公开证书", "", "PEM 证书 (*.pem *.cer *.crt);;所有文件 (*)")
+        if not name:
+            return
+        try:
+            path = Path(name)
+            if not path.is_file():
+                raise ValueError()
+            with path.open("rb") as stream:
+                data = stream.read(16 * 1024 + 1)
+            if len(data) > 16 * 1024 or b"PRIVATE KEY" in data:
+                raise ValueError()
+            self._pem = data.decode("ascii")
+        except (OSError, ValueError):
+            self._pem = ""
+            self.status.setText("无法读取公开 PEM；请检查文件后重选")
+        else:
+            self.status.setText("已读取，请核对手机上的完整指纹")
+        self.changed.emit()
+
+
 def _validate_connection(request: _ConnectionInput) -> None:
     if any(ord(char) < 32 for char in request.url + request.username + request.password):
         raise ValueError("地址、用户名和密码不能包含换行或控制字符")
@@ -216,14 +290,36 @@ def _validate_connection(request: _ConnectionInput) -> None:
         raise ValueError("WebDAV 端口必须为 1–65535")
 
 
-def _write_connection(config: Config, request: _ConnectionInput) -> None:
+def _apply_connection(config: Config, request: _ConnectionInput, *, allow_unconfigured: bool = False) -> bool:
+    if allow_unconfigured and not request.url and not config.url and not request.use_phone_certificate:
+        return False  # Save unrelated preferences before the first connection.
     _validate_connection(request)
-    changed_target = (config.url, config.username) != (request.url, request.username)
+    previous = (config.url, config.username, config.get("nas.tls_fingerprint", ""))
+    trust = None
+    if request.use_phone_certificate:
+        trust = read_nas_trust(request.url, request.certificate, request.fingerprint)
+        if trust is None:
+            raise ValueError("请先导入公开证书并填写核对后的指纹")
+    fingerprint = trust.fingerprint if trust is not None else ""
+    identity = (request.url, request.username, fingerprint)
+    changed_target = previous != identity
+    if changed_target and (previous[2] or fingerprint) and not request.password:
+        raise ValueError("更换配对身份或取消证书绑定时，请重新输入密码")
+    if trust is not None and (not request.username or ":" in request.username or
+                              not (request.password or config.get("nas.password_enc"))):
+        raise ValueError("请输入 PhoneNAS 用户名和密码")
     config.set("nas.url", request.url)
     config.set("nas.username", request.username)
+    config.set("nas.tls_certificate", trust.pem if trust is not None else "")
+    config.set("nas.tls_fingerprint", fingerprint)
+    config.set("version", 4 if trust is not None else 3)
     if request.password:
         config.password = request.password
-    if changed_target:
+    return changed_target
+
+
+def _write_connection(config: Config, request: _ConnectionInput, *, allow_unconfigured: bool = False) -> None:
+    if _apply_connection(config, request, allow_unconfigured=allow_unconfigured):
         config.replace_tasks(
             replace(task, last_sync_at="", last_file_count=0, sync_identity=uuid.uuid4().hex)
             for task in config.tasks
@@ -234,8 +330,8 @@ def _test_connection(
     worker: _OperationThread, snapshot: Config, request: _ConnectionInput
 ) -> _ConnectionResult:
     worker._secrets.append(request.password)
-    _validate_connection(request)
     worker.check_cancelled()
+    _apply_connection(snapshot, request)
     password = request.password or snapshot.password
     worker._secrets.append(password)
     client = Rclone(snapshot)
@@ -379,6 +475,8 @@ class SettingsPage(QWidget, _AsyncOperations):
         credentials.addLayout(_field("用户名", self.user_edit), 1)
         credentials.addLayout(_field("密码", self.pass_edit), 1)
         connection_layout.addLayout(credentials)
+        self.phone_certificate = _PhoneCertificateFields()
+        connection_layout.addWidget(self.phone_certificate)
         test_row = QHBoxLayout()
         self.test_button = button("测试连接", glyph="link")
         self.test_label = label("尚未测试当前输入", "muted")
@@ -462,7 +560,7 @@ class SettingsPage(QWidget, _AsyncOperations):
         root.addLayout(actions)
 
         self._editors = (
-            self.url_edit, self.user_edit, self.pass_edit, self.drive_combo,
+            self.url_edit, self.user_edit, self.pass_edit, self.phone_certificate, self.drive_combo,
             self.mount_check, self.read_only_check, self.network_check, self.auto_mount_check,
             self.autostart_check, self.tray_check, self.mirror_enabled_check,
         )
@@ -475,6 +573,7 @@ class SettingsPage(QWidget, _AsyncOperations):
         self.winfsp_button.clicked.connect(self._install_winfsp)
         for edit in (self.url_edit, self.user_edit, self.pass_edit):
             edit.textChanged.connect(self._connection_edited)
+        self.phone_certificate.changed.connect(self._connection_edited)
         self.load()
 
     def load(self) -> None:
@@ -482,6 +581,7 @@ class SettingsPage(QWidget, _AsyncOperations):
         self.url_edit.setText(self.config.url)
         self.user_edit.setText(self.config.username)
         self.pass_edit.clear()
+        self.phone_certificate.load(self.config)
         self.drive_combo.setCurrentText(self.config.get("mount.drive", C.DEFAULT_DRIVE))
         self.mount_check.setChecked(bool(self.config.get("mount.enabled", True)))
         self.read_only_check.setChecked(bool(self.config.get("mount.read_only", True)))
@@ -499,10 +599,10 @@ class SettingsPage(QWidget, _AsyncOperations):
         self._refresh_controls()
 
     def _connection_input(self) -> _ConnectionInput:
-        return _ConnectionInput(
+        return self.phone_certificate.apply_to(_ConnectionInput(
             self.url_edit.text().strip().rstrip("/"),
             self.user_edit.text().strip(), self.pass_edit.text(),
-        )
+        ))
 
     def _connection_edited(self) -> None:
         if not self.busy:
@@ -567,7 +667,7 @@ class SettingsPage(QWidget, _AsyncOperations):
 
         def save_config(worker: _OperationThread) -> _SavedSettings:
             worker._secrets.append(request.connection.password)
-            _write_connection(draft, request.connection)
+            _write_connection(draft, request.connection, allow_unconfigured=True)
             for key, value in (
                 ("mount.drive", request.drive), ("mount.enabled", request.mount_enabled),
                 ("mount.read_only", request.read_only),

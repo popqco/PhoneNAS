@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 from datetime import datetime
+from time import monotonic
 from urllib.parse import quote
 
 from PySide6.QtCore import QObject, QTimer, Signal
@@ -12,6 +13,7 @@ from app.core.config import Config, data_dir
 from app.core.log import get_logger
 from app.core.rclone import Rclone
 
+STARTUP_TIMEOUT_SECONDS = 30
 BACKOFF_SECONDS = [5, 15, 30, 60, 120]
 MAX_RETRIES = len(BACKOFF_SECONDS)
 
@@ -26,6 +28,7 @@ class MountSupervisor(QObject):
         self.rclone = Rclone(config)
         self.log = get_logger()
         self._proc = None
+        self._startup_deadline: float | None = None
         self._state = "stopped"
         self._want_mounted = False
         self._retry_index = 0
@@ -55,6 +58,10 @@ class MountSupervisor(QObject):
 
     def start(self) -> None:
         if self._proc is not None and self._proc.poll() is None:
+            return
+        if not self.config.url:
+            self._set_state("error")
+            self.log_line.emit("请先在设置中填写 WebDAV 地址")
             return
         self._want_mounted = True
         self._retry_index = 0
@@ -122,6 +129,7 @@ class MountSupervisor(QObject):
             self.log_line.emit(f"挂载启动失败: {self._redact(exc, password)}")
             self._schedule_retry()
             return
+        self._startup_deadline = monotonic() + STARTUP_TIMEOUT_SECONDS
         self._set_state("starting")
         self.log_line.emit(f"正在挂载到 {self.drive}…")
         self._poll_timer.start()
@@ -131,13 +139,23 @@ class MountSupervisor(QObject):
             return
         code = self._proc.poll()
         if code is None:
-            if self._state == "starting" and self.drive_ready():
+            if self._startup_deadline is None:
+                return
+            # A visible drive is a local startup signal, not a NAS reachability check.
+            if self.drive_ready():
+                self._startup_deadline = None
                 self._retry_index = 0
                 self._set_state("mounted")
                 self.log_line.emit(f"已挂载 {self.drive}")
+            elif monotonic() >= self._startup_deadline:
+                self._poll_timer.stop()
+                self._kill_proc()
+                self.log_line.emit(f"挂载启动超时：盘符 {self.drive} 在 {STARTUP_TIMEOUT_SECONDS} 秒内未就绪")
+                self._schedule_retry()
             return
         # process exited
         self._poll_timer.stop()
+        self._startup_deadline = None
         self.rclone.release(self._proc)
         self._proc = None
         if not self._want_mounted:
@@ -162,6 +180,7 @@ class MountSupervisor(QObject):
     def _kill_proc(self) -> None:
         proc = self._proc
         self._proc = None
+        self._startup_deadline = None
         if proc is None:
             return
         try:

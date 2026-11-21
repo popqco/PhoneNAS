@@ -14,6 +14,7 @@ from dataclasses import replace
 from datetime import datetime
 
 from app import constants as C
+from app.core.nas_tls import NasTrust, read_nas_trust
 from app.core.tasks import MirrorTask, validate_tasks
 
 
@@ -134,12 +135,27 @@ def _decode_config(incoming: Any) -> tuple[dict[str, Any], bool]:
     if not isinstance(incoming, dict):
         raise ValueError("配置必须是 JSON 对象")
     version = incoming.get("version", 1)
-    if type(version) is not int or version not in (1, 2, 3):
+    if type(version) is not int or version not in (1, 2, 3, 4):
         raise ValueError(f"不支持的配置版本: {version!r}")
     for section in ("nas", "mount", "mirror", "app"):
         if section in incoming and not isinstance(incoming[section], dict):
             raise ValueError(f"{section} 配置必须是对象")
     data = _deep_merge(DEFAULTS, incoming)
+    nas = data["nas"]
+    pem, fingerprint = nas.get("tls_certificate", ""), nas.get("tls_fingerprint", "")
+    if type(pem) is not str or type(fingerprint) is not str:
+        raise ValueError("PhoneNAS 证书配置类型不正确")
+    if version == 4:
+        if type(nas["url"]) is not str:
+            raise ValueError("nas.url 配置类型不正确")
+        # Expired certificates can still be loaded so the user can re-pair.
+        # Every connection verifies the time before sending credentials.
+        trust = read_nas_trust(nas["url"], pem, fingerprint, check_time=False)
+        if trust is None:
+            raise ValueError("缺少 PhoneNAS 已配对证书，不能回退到通用 WebDAV 信任")
+        nas.update(tls_certificate=trust.pem, tls_fingerprint=trust.fingerprint)
+    elif pem or fingerprint:
+        raise ValueError("PhoneNAS 证书需要新版连接配置")
     if version in (1, 2) and "read_only" not in incoming.get("mount", {}):
         # Existing installations may intentionally use a writable mount; new
         # configurations default read-only without silently changing old ones.
@@ -159,7 +175,7 @@ def _decode_config(incoming: Any) -> tuple[dict[str, Any], bool]:
         remote_path = legacy.get("remote_path", "backup/work")
         versions_path = legacy.get("versions_path", "backup/work-versions")
         identity = json.dumps([local_path, remote_path, versions_path], ensure_ascii=False)
-        task = MirrorTask.from_dict({
+        task = None if "local_path" not in legacy and not local_path else MirrorTask.from_dict({
             "id": uuid.uuid5(uuid.NAMESPACE_URL, "phonenas-v1:" + identity).hex,
             "name": Path(local_path).name if isinstance(local_path, str) and local_path else "工作文件夹",
             "enabled": legacy.get("enabled", True),
@@ -176,8 +192,9 @@ def _decode_config(incoming: Any) -> tuple[dict[str, Any], bool]:
         for key in ("local_path", "remote_path", "versions_path", "interval_minutes", "retention_days",
                     "exclude_preset", "excludes", "last_sync_at", "last_file_count"):
             extra.pop(key, None)
-        data["mirror"] = {**extra, "enabled": legacy.get("enabled", True), "tasks": [task.to_dict()]}
-    data["version"] = 3
+        data["mirror"] = {**extra, "enabled": legacy.get("enabled", True),
+                          "tasks": [task.to_dict()] if task is not None else []}
+    data["version"] = version if version >= 3 else 3
     if not isinstance(data["mirror"]["tasks"], list):
         raise ValueError("mirror.tasks 必须是列表")
     tasks = tuple(MirrorTask.from_dict(item) for item in data["mirror"]["tasks"])
@@ -334,6 +351,13 @@ class Config:
     def username(self) -> str:
         return self.get("nas.username") or ""
 
+    def nas_trust(self) -> NasTrust | None:
+        trust = read_nas_trust(self.url, self.get("nas.tls_certificate", ""),
+                               self.get("nas.tls_fingerprint", ""))
+        if (trust is not None) != (self.get("version") == 4):
+            raise ValueError("PhoneNAS 证书设置不完整，拒绝连接")
+        return trust
+
     def _first_task(self) -> MirrorTask:
         if not self.tasks:
             raise ValueError("没有可用同步任务，请先选择或新建任务")
@@ -371,7 +395,15 @@ class Config:
         incoming = json.loads(Path(path).read_text(encoding="utf-8-sig"))
         payload, migrated = _decode_config(incoming)
         keep_password = self.get("nas.password_enc", "")
-        if not payload["nas"]["password_enc"]:
+        if self.get("version") == 4 or payload["version"] == 4:
+            # An import of a paired connection is an identity change unless the
+            # already trusted endpoint, account and pin all match. Never reuse
+            # an imported credential or send the old password to a new pin.
+            identity = (self.url, self.username, self.get("nas.tls_fingerprint", ""))
+            incoming_identity = (payload["nas"]["url"].rstrip("/"), payload["nas"]["username"],
+                                 payload["nas"].get("tls_fingerprint", ""))
+            payload["nas"]["password_enc"] = keep_password if identity == incoming_identity else ""
+        elif not payload["nas"]["password_enc"]:
             payload["nas"]["password_enc"] = keep_password
         draft = self.snapshot()
         draft.data = payload

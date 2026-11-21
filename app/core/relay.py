@@ -323,6 +323,9 @@ class BaselineStore:
                         "url": config.url, "username": config.username,
                         "local_path": task.local_path, "local_history_path": task.local_history_path,
                         "sync_identity": _uuid(task.sync_identity)}
+        trust = config.nas_trust() if hasattr(config, "nas_trust") else None
+        if trust is not None:
+            self.binding["tls_fingerprint"] = trust.fingerprint
 
     def load(self) -> tuple[ContentSnapshot, str] | None:
         _no_links(self.path)
@@ -336,11 +339,14 @@ class BaselineStore:
             if (type(payload) is not dict or set(payload) != {
                     "version", "binding", "snapshot", "generation", "content_digest"}
                     or type(payload["version"]) is not int or payload["version"] != 1
-                    or type(payload["binding"]) is not dict
-                    or set(payload["binding"]) != set(self.binding)):
+                    or type(payload["binding"]) is not dict):
                 raise ValueError("无效的基线格式")
             binding = payload["binding"]
-            if any(type(binding[key]) is not type(value) for key, value in self.binding.items()):
+            if (set(binding) - {"tls_fingerprint"} != set(self.binding) - {"tls_fingerprint"}
+                    or any(type(binding[key]) is not type(value) for key, value in self.binding.items()
+                           if key != "tls_fingerprint")
+                    or ("tls_fingerprint" in binding and (type(binding["tls_fingerprint"]) is not str
+                        or not re.fullmatch(r"[0-9a-f]{64}", binding["tls_fingerprint"])))):
                 raise ValueError("无效的基线绑定")
             _uuid(binding["sync_identity"])
             if (not re.fullmatch(r"[0-9a-f]{32}", binding["dataset_id"])
@@ -572,8 +578,13 @@ class _WebDAVDatasetLease:
         self.url = config.url.rstrip("/") + "/" + urllib.parse.quote(control, safe="/") + "/"
         credentials = f"{config.username}:{config.password}".encode("utf-8")
         self.authorization = "Basic " + base64.b64encode(credentials).decode("ascii")
-        # Ignore proxy environment and refuse every redirect, including same-host.
-        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+        # Ignore proxies and refuse every redirect, including same-host. When
+        # paired, verify the exact same leaf as the transfer child before auth.
+        trust = config.nas_trust() if hasattr(config, "nas_trust") else None
+        handlers = [urllib.request.ProxyHandler({}), _NoRedirect()]
+        if trust is not None:
+            handlers.append(trust.https_handler())
+        self.opener = urllib.request.build_opener(*handlers)
 
     def _request(self, method: str, url: str, data: bytes | None = None) -> tuple[int, bytes]:
         headers = {"Authorization": self.authorization}

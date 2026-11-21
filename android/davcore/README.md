@@ -8,4 +8,23 @@
 - `test_native_remote.py` 用显式提供的私有合成凭据、服务器公开证书和独立核对的指纹验证设备上的隔离 HTTPS 共享；不自动发现或重配设备。
 - `test_native_*_safety.py` 验证脚本自己的参数和清理范围；`audit_runtime_journal.py` 可以离线核对已导出的脱敏结构化记录。
 
-Go 主机合同优先从 `../gokernel` 运行 `go test -count=1 ./...`。测试只在临时根下工作；原始验收报告、已配置地址和私有输入均不在仓库中。[验收结论与边界](../../docs/ANDROID-ACCEPTANCE.md)。
+Go 主机合同优先从 `../gokernel` 运行 `go test -count=1 ./...`。维护分支另外提供一个不接受真实目录的回环 TLS 夹具，可用 Windows 实际同步引擎跑发布、接收、交回、冲突及历史验证。在装好桌面依赖且备有仓库校验过的 `vendor/rclone.exe` 后，从仓库根运行：
+
+```powershell
+$fixture = Join-Path ([IO.Path]::GetTempPath()) ("PhoneNAS-relay-" + [guid]::NewGuid())
+New-Item -ItemType Directory $fixture | Out-Null
+$env:PHONENAS_TEST_RELAY_FIXTURE = Join-Path $fixture 'relayfixture.exe'
+try {
+    Push-Location android/gokernel
+    try { go build -o $env:PHONENAS_TEST_RELAY_FIXTURE ./cmd/relayfixture } finally { Pop-Location }
+    if ($LASTEXITCODE -ne 0) { throw 'Unable to build the isolated fixture' }
+    python -m unittest discover -s tests -p test_nas_relay.py -v
+    if ($LASTEXITCODE -ne 0) { throw 'Isolated HTTPS relay test failed' }
+} finally {
+    Remove-Item Env:PHONENAS_TEST_RELAY_FIXTURE
+    if (Test-Path (Join-Path $fixture 'relayfixture.exe')) { Remove-Item (Join-Path $fixture 'relayfixture.exe') }
+    Remove-Item $fixture
+}
+```
+
+测试只在临时根下工作；原始验收报告、已配置地址和私有输入均不在仓库中。[验收结论与边界](../../docs/ANDROID-ACCEPTANCE.md)。
