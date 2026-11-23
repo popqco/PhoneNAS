@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import ssl
 import tempfile
 import threading
 import unittest
@@ -14,8 +15,8 @@ from unittest.mock import patch
 from app.core.config import Config
 from app.core.rclone import Rclone, Result, rclone_exe
 from app.core.relay import (BaselineStore, ContentSnapshot, DatasetCoordinator,
-                            FileContent, LocalDatasetLease, find_published_dataset,
-                            snapshot_tree)
+                            FileContent, LocalDatasetLease, _unverified_ssl_context,
+                            find_published_dataset, snapshot_tree)
 from app.core.tasks import new_task
 
 
@@ -58,6 +59,13 @@ class ScriptedRclone:
         if not self.results:
             raise AssertionError(f"unexpected rclone operation: {args}")
         return self.results.pop(0)
+
+
+class TlsContextTests(unittest.TestCase):
+    def test_phone_self_signed_certificate_is_accepted_for_control_requests(self):
+        context = _unverified_ssl_context()
+        self.assertFalse(context.check_hostname)
+        self.assertEqual(context.verify_mode, ssl.CERT_NONE)
 
 
 class SnapshotTests(IsolatedTest):

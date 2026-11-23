@@ -123,10 +123,12 @@ def build_sync_args(
     remote = f"{C.DEFAULT_REMOTE}:{task.remote_path}"
     source, destination = (remote, task.local_path) if receiving else (task.local_path, remote)
     history = str(Path(task.local_history_path) / timestamp) if receiving else f"{C.DEFAULT_REMOTE}:{task.versions_path}/{timestamp}"
+    # The phone kernel serializes PUTs with a writers lock, so extra client
+    # transfers only contend and slow the upload down.
     args = [
         "sync", source, destination,
         "--backup-dir", history,
-        "--transfers", "4", "--checkers", "8", "--create-empty-src-dirs",
+        "--transfers", "1", "--checkers", "8", "--create-empty-src-dirs",
         "--check-first", "--delete-after", "--stats", "2s", "--stats-one-line",
         "--use-json-log", "--log-level", "INFO", "--retries", "1",
         "--timeout", "60s", "--contimeout", "15s", "--low-level-retries", "2",
@@ -791,7 +793,7 @@ class SyncEngine:
             raise RuntimeError(f"{message}：{result.err or result.out or result.code}")
 
     def _run_transfer(self, args: list[str]) -> None:
-        args = [*args, "--transfers", "4", "--checkers", "8", "--stats", "2s",
+        args = [*args, "--transfers", "1", "--checkers", "8", "--stats", "2s",
                 "--use-json-log", "--log-level", "INFO", "--retries", "1",
                 "--timeout", "60s", "--contimeout", "15s", "--low-level-retries", "2"]
         proc = self.rclone.popen(args)

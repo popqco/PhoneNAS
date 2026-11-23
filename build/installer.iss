@@ -1,5 +1,5 @@
 #define MyAppName "PhoneNAS"
-#define MyAppVersion "1.2.6"
+#define MyAppVersion "1.2.8"
 #define MyAppExeName "PhoneNAS.exe"
 
 [Setup]

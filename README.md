@@ -4,6 +4,18 @@
 
 Windows 10/11 x64 · Python + PySide6 · rclone · WinFsp · 无广告
 
+## 1.2.8：上传改为单流
+
+- 手机原生 DAV 内核对每个 PUT 持有 `writers` 串行锁，电脑端原来的 4 路并发只会互相排队并增加开销。实测同一批文件：暖机单流 1.76 MiB/s，4 路约 0.37 MiB/s。
+- 上传/下载改为 `--transfers 1`，保留 `--checkers 8` 做并发校验。2.16 GiB 首传约 20–30 分钟（取决于手机冷启动和磁盘）。
+- 手机端无需改代码；不改变共享、密码或数据集格式。
+
+## 1.2.7：手机 HTTPS 入口支持
+
+- 手机端 0.4.3 起把 WebDAV 入口改为 `https://100.109.166.11:18889`，并使用自签名证书。PhoneNAS 现在让 rclone 和数据集锁控制请求接受该证书，不再因 `x509: certificate signed by unknown authority` 失败。
+- 默认地址更新为 `https://100.109.166.11:18889`。已有配置请在「设置 → WebDAV 地址」改为新入口；手机端密码如已更换，需要同步更新。
+- 连接的仍是配置里的私有/Tailscale 地址，控制请求继续禁用代理并拒绝重定向；本次没有放宽其他来源的证书校验。
+
 ## 1.2.6：Windows 长路径上传修复
 
 - 修复来源目录最深路径接近 Windows 260 字符上限时，上传在“校验暂存文件”阶段报 `[WinError 145] 目录不是空的` 的问题。暂存目录位于 `%TEMP%`，会比来源路径更长；现在扫描、清理和本地历史读写对长路径使用 `\\?\` 扩展形式。
@@ -82,7 +94,7 @@ Windows 10/11 x64 · Python + PySide6 · rclone · WinFsp · 无广告
 
 ## 下载安装
 
-本源码版本为 **1.2.6**。GitHub 已发布的旧包见 [Release v1.2.3](https://github.com/popqco/PhoneNAS/releases/tag/v1.2.3) 或[发布列表](https://github.com/popqco/PhoneNAS/releases)；下表和校验值仅用于核对 1.2.3。1.2.6 可按本文构建，本地构建不等同于 GitHub Release。
+本源码版本为 **1.2.8**。GitHub 已发布的旧包见 [Release v1.2.3](https://github.com/popqco/PhoneNAS/releases/tag/v1.2.3) 或[发布列表](https://github.com/popqco/PhoneNAS/releases)；下表和校验值仅用于核对 1.2.3。1.2.8 可按本文构建，本地构建不等同于 GitHub Release。
 
 | 文件 | 用途 |
 | --- | --- |

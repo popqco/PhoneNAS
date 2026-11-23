@@ -205,7 +205,7 @@ class ConfigV3Tests(unittest.TestCase):
                 config = Config(path)
                 self.assertEqual(config.load_error, "")
                 self.assertEqual(config.url, C.DEFAULT_URL)
-                self.assertEqual(config.username, "admin")
+                self.assertEqual(config.username, "phonenas")
                 self.assertIs(config.get("mount.auto_mount"), True)
                 self.assertIs(config.get("app.start_with_windows"), True)
                 if version in (None, 1):

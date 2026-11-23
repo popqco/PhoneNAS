@@ -76,7 +76,12 @@ class Rclone:
         # A WinFsp mount and connection check are not a payload operation.
         # Mount keeps the Windows VFS naming behavior that Explorer expects.
         literal = args and args[0] in _FILENAME_COMMANDS
-        return [str(exe), *args, *(LITERAL_FLAGS if literal else ()), "--config", str(conf)]
+        # The phone serves its WebDAV endpoint with a self-signed certificate.
+        # PhoneNAS only talks to the configured private/Tailscale address, so
+        # certificate verification cannot add trust there and would block the
+        # HTTPS entry entirely.
+        return [str(exe), *args, *(LITERAL_FLAGS if literal else ()),
+                "--no-check-certificate", "--config", str(conf)]
 
     def run(
         self, args: list[str], timeout: int = 120, conf_path: Path | None = None,

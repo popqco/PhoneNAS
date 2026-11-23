@@ -99,7 +99,7 @@ _SAVED_DEFAULTS: dict[str, Any] = {
     "version": 3,
     "nas": {
         "url": C.DEFAULT_URL,
-        "username": "admin",
+        "username": "phonenas",
         "password_enc": "",
     },
     "mount": {

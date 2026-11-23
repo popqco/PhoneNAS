@@ -4,9 +4,9 @@ import sys
 from pathlib import Path
 
 APP_NAME = "PhoneNAS"
-APP_VERSION = "1.2.6"
+APP_VERSION = "1.2.8"
 
-DEFAULT_URL = "http://100.109.166.11:8888"
+DEFAULT_URL = "https://100.109.166.11:18889"
 DEFAULT_REMOTE = "phone"
 DEFAULT_DRIVE = "X:"
 DEFAULT_LOCAL_PATH = r"D:\LefeetHardware"

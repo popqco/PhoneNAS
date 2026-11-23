@@ -88,6 +88,7 @@ class SyncArgsTests(unittest.TestCase):
             self.assertIn("phone:backup/work/versions/2026-11-14_153000", args)
             self.assertIn("build/**", args)
             self.assertIn("*.tmp", args)
+            self.assertEqual(args[args.index("--transfers") + 1], "1")
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import ssl
 import stat
 import tempfile
 import time
@@ -746,6 +747,19 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def _unverified_ssl_context() -> ssl.SSLContext:
+    """Accept the phone's self-signed certificate on its private endpoint.
+
+    The control requests already refuse proxies and redirects, and the URL is
+    restricted to the configured phone address, so host verification cannot
+    establish a stronger identity than the user's own endpoint.
+    """
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    return context
+
+
 class _WebDAVDatasetLease:
     """Atomic MKCOL, not rclone mkdir. HTTP cleanup ignores rclone cancellation.
 
@@ -768,7 +782,10 @@ class _WebDAVDatasetLease:
         credentials = f"{config.username}:{config.password}".encode("utf-8")
         self.authorization = "Basic " + base64.b64encode(credentials).decode("ascii")
         # Ignore proxy environment and refuse every redirect, including same-host.
-        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+        handlers = [urllib.request.ProxyHandler({}), _NoRedirect()]
+        if base.scheme == "https":
+            handlers.append(urllib.request.HTTPSHandler(context=_unverified_ssl_context()))
+        self.opener = urllib.request.build_opener(*handlers)
 
     def for_registration(self):
         lease = _WebDAVDatasetLease(self.rclone, self.task)

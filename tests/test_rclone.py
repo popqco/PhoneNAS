@@ -58,6 +58,7 @@ class RcloneIsolationTests(unittest.TestCase):
                 self.assertTrue(client.run(command, conf_path=private).ok)
                 args, options = spawn.call_args
                 self.assertEqual(args[0][1:1 + len(command)], command)
+                self.assertIn("--no-check-certificate", args[0])
                 self.assertEqual(args[0][-2:], ["--config", str(private)])
                 self.assertNotIn("RCLONE_EXCLUDE", options["env"])
                 self.assertFalse(any(key.upper() == "RCLONE_WEBDAV_URL" for key in options["env"]))
@@ -65,6 +66,7 @@ class RcloneIsolationTests(unittest.TestCase):
                 mount = spawn.call_args.args[0]
                 self.assertNotIn("--local-encoding", mount)
                 self.assertNotIn("--webdav-encoding", mount)
+                self.assertIn("--no-check-certificate", mount)
                 self.assertEqual(mount[-2:], ["--config", str(private)])
 
     def test_configuration_line_injection_is_rejected_before_obscuring(self):
