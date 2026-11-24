@@ -13,9 +13,11 @@ from pathlib import Path
 from typing import Any, Iterable
 from dataclasses import replace
 from datetime import datetime
+from types import SimpleNamespace
 
 from app import constants as C
 from app.core.tasks import MirrorTask, validate_tasks
+from app.core.tls import trusted_leaf, webdav_url
 
 
 # --------------------------------------------------------------------------- paths
@@ -94,13 +96,18 @@ def decrypt_password(encoded: str) -> str:
 
 # --------------------------------------------------------------------------- config
 
-# Preserve the meaning of omitted fields in v1-v3 files, including imports.
+# Keep 1.2.3 defaults for display while the provenance of omitted NAS fields is reviewed.
+_CONNECTION_FIELDS = ("url", "username")
+_BINDING_REVIEW = "binding_review"
+
 _SAVED_DEFAULTS: dict[str, Any] = {
     "version": 3,
     "nas": {
-        "url": C.DEFAULT_URL,
-        "username": "phonenas",
+        "url": C.LEGACY_DEFAULT_URL,
+        "username": C.LEGACY_DEFAULT_USERNAME,
         "password_enc": "",
+        "tls_url": "",
+        "tls_cert": "",
     },
     "mount": {
         "enabled": True,
@@ -140,7 +147,7 @@ DEFAULTS: dict[str, Any] = _deep_merge(_SAVED_DEFAULTS, {
 })
 
 
-def _decode_config(incoming: Any) -> tuple[dict[str, Any], bool]:
+def _decode_config(incoming: Any) -> tuple[dict[str, Any], bool, tuple[str, ...]]:
     if not isinstance(incoming, dict):
         raise ValueError("配置必须是 JSON 对象")
     version = incoming.get("version", 1)
@@ -158,6 +165,12 @@ def _decode_config(incoming: Any) -> tuple[dict[str, Any], bool]:
         for key, default in _SAVED_DEFAULTS[section].items():
             if type(data[section][key]) is not type(default):
                 raise ValueError(f"{section}.{key} 配置类型不正确")
+    nas = data["nas"]
+    saved_nas = incoming.get("nas", {})
+    recorded_review = nas.pop(_BINDING_REVIEW, [])
+    if type(recorded_review) is not list or any(field not in _CONNECTION_FIELDS for field in recorded_review):
+        raise ValueError("旧连接复核字段无效")
+    review = tuple(field for field in _CONNECTION_FIELDS if field not in saved_nas or field in recorded_review)
     if type(data["mirror"]["enabled"]) is not bool:
         raise ValueError("mirror.enabled 必须是布尔值")
     migrated = version in (1, 2)
@@ -193,13 +206,83 @@ def _decode_config(incoming: Any) -> tuple[dict[str, Any], bool]:
     tasks = tuple(MirrorTask.from_dict(item) for item in data["mirror"]["tasks"])
     validate_tasks(tasks, data["mount"]["drive"])
     data["mirror"]["tasks"] = [task.to_dict() for task in tasks]
-    return data, migrated
+    return data, migrated, review
+
+
+def _normalize_tls(nas: dict[str, Any], review: tuple[str, ...] = ()) -> None:
+    endpoint = nas["tls_url"].rstrip("/")
+    # A placeholder URL is not an endpoint change; keep the local enrollment dormant.
+    if nas["tls_cert"] and ("url" in review or endpoint == nas["url"].rstrip("/")):
+        if webdav_url(endpoint).scheme != "https":
+            raise ValueError("服务器证书必须绑定 HTTPS 地址")
+        nas["tls_url"] = endpoint
+        nas["tls_cert"] = trusted_leaf(nas["tls_cert"])
+    else:
+        # A confirmed endpoint change cannot revive the old enrollment later.
+        nas["tls_url"] = nas["tls_cert"] = ""
+
+
+def _record_binding_review(payload: dict[str, Any], review: tuple[str, ...]) -> dict[str, Any]:
+    if review:
+        return {**payload, "nas": {**payload["nas"], _BINDING_REVIEW: list(review)}}
+    return payload
 
 
 _TASK_BINDING_FIELDS = (
     "direction", "local_path", "remote_path", "versions_path", "local_history_path",
     "dataset_id", "excludes", "sync_identity",
 )
+_PENDING_SUFFIX = ".pending.json"
+_PENDING_UNVERIFIABLE = "存在未完成操作记录，无法确认原配置的任务绑定"
+
+
+def _connection_identity(nas: dict[str, Any]) -> tuple[str, str]:
+    return nas["url"].rstrip("/"), nas["username"]
+
+
+def _validate_connection_identity(connection: tuple[str, str]) -> None:
+    url, username = connection
+    webdav_url(url)
+    if any(ord(char) < 32 or ord(char) == 127 for char in username):
+        raise ValueError("用户名不能包含换行或控制字符")
+
+
+def _known_pending_connection(
+    nas: dict[str, Any], review: tuple[str, ...], pending: list[tuple[Path, dict[str, Any]]]
+) -> tuple[str, str] | None:
+    if not pending:
+        return None
+    for default_url, default_username in ((C.LEGACY_DEFAULT_URL, C.LEGACY_DEFAULT_USERNAME),
+                                          (C.PREVIEW_DEFAULT_URL, C.PREVIEW_DEFAULT_USERNAME)):
+        candidate = (default_url if "url" in review else nas["url"].rstrip("/"),
+                     default_username if "username" in review else nas["username"])
+        if _matches_pending_connection(candidate, pending):
+            return candidate
+    return None
+
+
+def _matches_pending_connection(
+    connection: tuple[str, str], pending: list[tuple[Path, dict[str, Any]]]
+) -> bool:
+    # Use the recovery reader's complete validation, including its known state
+    # variants. A journal can corroborate a candidate, never supply a URL or password.
+    from app.core.pending import PendingOperation
+    from app.core.relay import BaselineStore
+
+    try:
+        _validate_connection_identity(connection)
+        endpoint = SimpleNamespace(url=connection[0], username=connection[1])
+        for path, task in pending:
+            info = path.lstat()
+            if (not stat.S_ISREG(info.st_mode)
+                    or getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+                return False
+            journal = PendingOperation(BaselineStore(path.parent, MirrorTask.from_dict(task), endpoint))
+            if journal.load() is None:
+                return False
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return True
 
 
 class Config:
@@ -219,12 +302,30 @@ class Config:
         self._migrated = False
         self._migration_original = None
         self._migration_version = None
+        self._connection_review: tuple[str, ...] = ()
+        self._recovered_connection: tuple[bytes, tuple[str, str]] | None = None
         if not self.path.exists():
             return
         try:
             original = self.path.read_bytes()
             incoming = json.loads(original.decode("utf-8-sig"))
-            self.data, self._migrated = _decode_config(incoming)
+            data, migrated, review = _decode_config(incoming)
+            connection = None
+            if review:
+                try:
+                    pending = self._pending_tasks(data, self._pending_entries())
+                except (OSError, ValueError):
+                    pending = []  # An unavailable journal cannot authorize a connection.
+                connection = _known_pending_connection(data["nas"], review, pending)
+                if connection is not None:
+                    for key, value in zip(_CONNECTION_FIELDS, connection):
+                        if key in review:
+                            data["nas"][key] = value
+                    review = ()
+            _normalize_tls(data["nas"], review)
+            self.data, self._migrated, self._connection_review = data, migrated, review
+            if connection is not None:
+                self._recovered_connection = original, connection
             if self._migrated:
                 self._migration_original = original
                 self._migration_version = incoming.get("version", 1)
@@ -236,18 +337,30 @@ class Config:
     def save(self) -> None:
         self._save()
 
+    def save_recovered_connection(self) -> bool:
+        """Persist a journal-proven connection before recovery can clear its evidence.
+
+        Return False when there is no inferred connection to persist. A failed
+        recheck or save must abort recovery before any journal is removed.
+        """
+        if self._recovered_connection is None:
+            return False
+        self.save()
+        return True
+
     def _save(self, *, backup_existing: bool = False) -> None:
         if self.load_error:
             raise ValueError(f"配置加载失败，拒绝覆盖原文件: {self.load_error}")
-        payload, _ = _decode_config(self.data)
+        payload, _, review = _decode_config(_record_binding_review(self.data, self._connection_review))
+        _normalize_tls(payload["nas"], review)
         # A draft may predate the on-disk config, and journals can outlive it.
-        try:
-            self.path.lstat()
-        except FileNotFoundError:
-            original = None
-        else:
-            original = self.path.read_bytes()
-        self._check_pending_bindings(original, payload)
+        original = self._saved_bytes()
+        has_pending = self._check_pending_bindings(original, payload, review)
+        if self._recovered_connection is not None:
+            recovered_from, connection = self._recovered_connection
+            if (not has_pending or original != recovered_from or review
+                    or _connection_identity(payload["nas"]) != connection):
+                raise ValueError(_PENDING_UNVERIFIABLE)
         if backup_existing and original is not None:
             self._backup_replaced_config(original)
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -259,55 +372,82 @@ class Config:
                 pass
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+            json.dumps(_record_binding_review(payload, review), ensure_ascii=False, indent=2), encoding="utf-8"
         )
         os.replace(tmp, self.path)
         self.data = payload
+        self._connection_review = review
+        self._recovered_connection = None
         self._migration_original = None
         self._migration_version = None
 
-    def _check_pending_bindings(self, original: bytes | None, payload: dict[str, Any]) -> None:
+    def _saved_bytes(self) -> bytes | None:
+        try:
+            self.path.lstat()
+        except FileNotFoundError:
+            return None
+        return self.path.read_bytes()
+
+    def _pending_entries(self) -> list[Path]:
         baselines = self.path.parent / "baselines"
         try:
             info = baselines.lstat()
         except FileNotFoundError:
-            return
+            return []
         if (not stat.S_ISDIR(info.st_mode)
                 or getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
             raise ValueError("基线状态路径不是普通目录，拒绝覆盖原配置")
+        # Every matching entry is protected, including unknown or broken records.
+        return [path for path in baselines.iterdir() if os.path.normcase(path.name).endswith(_PENDING_SUFFIX)]
 
-        suffix = ".pending.json"
-        # An entry alone is enough: never read or follow a recovery journal.
-        pending = {name for entry in baselines.iterdir()
-                   if (name := os.path.normcase(entry.name)).endswith(suffix)}
-        if not pending:
-            return
-        unverifiable = "存在未完成操作记录，无法确认原配置的任务绑定"
+    @staticmethod
+    def _pending_tasks(saved: dict[str, Any], entries: list[Path]) -> list[tuple[Path, dict[str, Any]]]:
+        by_name = {os.path.normcase(entry.name): entry for entry in entries}
+        matches = []
+        for task in saved["mirror"]["tasks"]:
+            if (name := os.path.normcase(f"{task['id']}{_PENDING_SUFFIX}")) in by_name:
+                matches.append((by_name[name], task))
+        if len(matches) != len(entries) or len({path for path, _ in matches}) != len(entries):
+            raise ValueError(_PENDING_UNVERIFIABLE)
+        return matches
+
+    def _check_pending_bindings(
+        self, original: bytes | None, payload: dict[str, Any], review: tuple[str, ...],
+    ) -> bool:
+        entries = self._pending_entries()
+        if not entries:
+            return False
         if original is None:
-            raise ValueError(unverifiable)
+            raise ValueError(_PENDING_UNVERIFIABLE)
         try:
-            saved, _ = _decode_config(json.loads(original.decode("utf-8-sig")))
+            saved, _, saved_review = _decode_config(json.loads(original.decode("utf-8-sig")))
         except (ValueError, TypeError, KeyError, RecursionError) as exc:
-            raise ValueError(unverifiable) from exc
-
-        saved_tasks = saved["mirror"]["tasks"]
-        saved_journal_names = {os.path.normcase(f"{task['id']}{suffix}") for task in saved_tasks}
-        if not pending.issubset(saved_journal_names):
-            raise ValueError(unverifiable)
-
-        # Compare the effective URL, just as the WebDAV client and journal do.
-        old_nas, new_nas = saved["nas"], payload["nas"]
-        connection_changed = (old_nas["url"].rstrip("/") != new_nas["url"].rstrip("/")
-                              or old_nas["username"] != new_nas["username"])
+            raise ValueError(_PENDING_UNVERIFIABLE) from exc
+        pending = self._pending_tasks(saved, entries)
+        saved_nas = saved["nas"]
+        old_connection = _connection_identity(saved_nas)
+        new_connection = _connection_identity(payload["nas"])
+        if saved_review and not review:
+            # Replacing a display guess with the proven old identity is not a rebind.
+            connection_changed = (
+                any(old != new and field not in saved_review for field, old, new in
+                    zip(_CONNECTION_FIELDS, old_connection, new_connection))
+                or not _matches_pending_connection(new_connection, pending)
+            )
+        else:
+            connection_changed = old_connection != new_connection or saved_review != review
+        try:
+            _normalize_tls(saved_nas, saved_review)
+        except ValueError as exc:
+            raise ValueError(_PENDING_UNVERIFIABLE) from exc
         candidates = {task["id"]: task for task in payload["mirror"]["tasks"]}
-        for old in saved_tasks:
+        for _, old in pending:
             task_id = old["id"]
-            if os.path.normcase(f"{task_id}{suffix}") not in pending:
-                continue
             new = candidates.get(task_id)
             if (connection_changed or new is None
                     or any(old[field] != new[field] for field in _TASK_BINDING_FIELDS)):
                 raise ValueError(f"任务 {task_id} 有未完成操作记录，请先恢复操作再更改连接、任务绑定或移除任务")
+        return True
 
     @property
     def load_error(self) -> str:
@@ -316,6 +456,28 @@ class Config:
     @property
     def migrated(self) -> bool:
         return self._migrated
+
+    @property
+    def connection_needs_confirmation(self) -> bool:
+        """A display value from an old sparse profile still lacks provenance."""
+        return bool(self._connection_review)
+
+    def confirm_connection(self) -> bool:
+        """Approve the draft's current connection; return whether it restores a pending binding.
+
+        Call only after explicit user confirmation. Save the draft before publishing it.
+        """
+        if self.load_error:
+            raise ValueError(f"配置加载失败: {self.load_error}")
+        if not self.connection_needs_confirmation:
+            return False
+        payload, _, _ = _decode_config(self.data)
+        _validate_connection_identity(_connection_identity(payload["nas"]))
+        _normalize_tls(payload["nas"])
+        restores_binding = self._check_pending_bindings(self._saved_bytes(), payload, ())
+        self.data["nas"] = payload["nas"]
+        self._connection_review = ()
+        return restores_binding
 
     @property
     def tasks(self) -> tuple[MirrorTask, ...]:
@@ -362,6 +524,8 @@ class Config:
         snapshot._migrated = self._migrated
         snapshot._migration_original = self._migration_original
         snapshot._migration_version = self._migration_version
+        snapshot._connection_review = self._connection_review
+        snapshot._recovered_connection = self._recovered_connection
         return snapshot
 
     def apply_snapshot(self, snapshot: Config) -> None:
@@ -373,6 +537,8 @@ class Config:
         self._migrated = snapshot._migrated
         self._migration_original = snapshot._migration_original
         self._migration_version = snapshot._migration_version
+        self._connection_review = snapshot._connection_review
+        self._recovered_connection = snapshot._recovered_connection
 
     # -- helpers ----------------------------------------------------------
     def get(self, dotted: str, default: Any = None) -> Any:
@@ -406,6 +572,31 @@ class Config:
     def username(self) -> str:
         return self.get("nas.username") or ""
 
+    @property
+    def certificate_enrollment(self) -> tuple[str, str]:
+        """Local enrollment for display/editing; it may still be pending review."""
+        endpoint = self.get("nas.tls_url", "")
+        if endpoint == self.url or "url" in self._connection_review:
+            return endpoint, self.get("nas.tls_cert", "")
+        return "", ""
+
+    def trusted_certificate_for(self, url: str) -> str:
+        if not self.connection_needs_confirmation:
+            endpoint, pem = self.certificate_enrollment
+            if url.rstrip("/") == endpoint:
+                return pem
+        return ""
+
+    def set_trusted_certificate(self, url: str, pem: str) -> None:
+        """Enroll only certificate bytes independently confirmed by the user."""
+        endpoint = url.rstrip("/")
+        if pem:
+            if endpoint != self.url or webdav_url(endpoint).scheme != "https":
+                raise ValueError("服务器证书必须绑定当前 HTTPS 地址")
+            pem = trusted_leaf(pem)
+        self.set("nas.tls_url", endpoint if pem else "")
+        self.set("nas.tls_cert", pem)
+
     def _first_task(self) -> MirrorTask:
         if not self.tasks:
             raise ValueError("没有可用同步任务，请先选择或新建任务")
@@ -434,20 +625,37 @@ class Config:
     # -- import / export --------------------------------------------------
     def export_to(self, path: Path) -> None:
         payload = copy.deepcopy(self.data)
-        payload.setdefault("nas", {})["password_enc"] = ""
+        nas = payload.setdefault("nas", {})
+        nas["password_enc"] = ""
+        nas.pop("tls_url", None)
+        nas.pop("tls_cert", None)
         payload.setdefault("app", {}).pop("schedule_approval", None)
         Path(path).write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+            json.dumps(_record_binding_review(payload, self._connection_review), ensure_ascii=False, indent=2),
+            encoding="utf-8",
         )
 
     def import_from(self, path: Path) -> None:
         incoming = json.loads(Path(path).read_text(encoding="utf-8-sig"))
-        payload, migrated = _decode_config(incoming)
+        # Importing a profile never enrolls a new trust anchor. Like a stored
+        # credential, local certificate trust can survive for the same address.
+        if isinstance(incoming, dict) and isinstance(incoming.get("nas"), dict):
+            incoming["nas"].pop("tls_cert", None)
+            incoming["nas"].pop("tls_url", None)
+        payload, migrated, review = _decode_config(incoming)
+        nas = payload["nas"]
         keep_password = self.get("nas.password_enc", "")
-        if not payload["nas"]["password_enc"]:
-            payload["nas"]["password_enc"] = keep_password
+        if not nas["password_enc"]:
+            nas["password_enc"] = keep_password
+        endpoint, pem = self.certificate_enrollment
+        if pem and (endpoint == nas["url"].rstrip("/") or "url" in review):
+            nas["tls_url"], nas["tls_cert"] = endpoint, pem
+            # Importing a matching address must not activate a dormant enrollment.
+            review = tuple(field for field in _CONNECTION_FIELDS
+                           if field in review or field in self._connection_review)
         draft = self.snapshot()
         draft.data = payload
+        draft._connection_review = review
         # Imported success times belong to another runtime/device. Re-inspect any
         # existing target before allowing it to be treated as our known mirror.
         draft.data["mirror"]["tasks"] = [

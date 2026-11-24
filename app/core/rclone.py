@@ -6,7 +6,8 @@ import sys
 import tempfile
 import threading
 import time
-from contextlib import contextmanager
+from configparser import ConfigParser
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,15 +15,19 @@ from app import constants as C
 from app.core.config import Config, app_root, data_dir
 from app.core.filenames import LITERAL_FLAGS
 from app.core.log import get_logger
+from app.core.tls import https_endpoint_proxy, trusted_leaf, webdav_url
 
 CREATE_NO_WINDOW = 0x08000000
 _FILENAME_COMMANDS = frozenset({"lsjson", "lsf", "hashsum", "cat", "mkdir", "copy", "copyto", "moveto", "purge", "sync"})
-# The private configuration and explicit flags, not shell-wide rclone
-# overrides, define the endpoint, names and scope checked by PhoneNAS.
-def _file_environment(args: list[str]) -> dict[str, str] | None:
-    if not args or (args[0] not in _FILENAME_COMMANDS and args[0] != "lsd"):
-        return None
-    return {key: value for key, value in os.environ.items() if not key.upper().startswith("RCLONE_")}
+_NETWORK_COMMANDS = _FILENAME_COMMANDS | {"lsd", "mount"}
+
+
+def _environment() -> dict[str, str]:
+    # Neither mount nor shorter private operations use external TLS, proxy or
+    # rclone settings. Use the application's connection and OS trust only.
+    return {key: value for key, value in os.environ.items()
+            if not key.upper().startswith(("RCLONE_", "SSL_CERT_"))
+            and not key.upper().endswith("_PROXY") and key.upper() != "SSLKEYLOGFILE"}
 
 
 def rclone_exe() -> Path:
@@ -71,34 +76,57 @@ class Rclone:
                 pass
 
     # -- process ----------------------------------------------------------
-    @staticmethod
-    def _command(exe: Path, args: list[str], conf: Path) -> list[str]:
-        # A WinFsp mount and connection check are not a payload operation.
-        # Mount keeps the Windows VFS naming behavior that Explorer expects.
-        literal = args and args[0] in _FILENAME_COMMANDS
-        # The phone serves its WebDAV endpoint with a self-signed certificate.
-        # PhoneNAS only talks to the configured private/Tailscale address, so
-        # certificate verification cannot add trust there and would block the
-        # HTTPS entry entirely.
-        return [str(exe), *args, *(LITERAL_FLAGS if literal else ()),
-                "--no-check-certificate", "--config", str(conf)]
+    def _command(
+        self, exe: Path, args: list[str], conf: Path, resources: ExitStack, *, expected_url: str,
+    ) -> list[str]:
+        # A WinFsp mount keeps the Windows VFS names that Explorer expects.
+        flags = list(LITERAL_FLAGS) if args and args[0] in _FILENAME_COMMANDS else []
+        if args and args[0] in _NETWORK_COMMANDS:
+            if self.config.connection_needs_confirmation:
+                raise ValueError("请先在设置中核对并保存 WebDAV 地址和账号")
+            flags.extend(("--allow-https-downgrade=false", "--webdav-auth-redirect=false"))
+            # Use the actual configuration selected for this process, including
+            # unsaved connection tests. Alias configurations are local fixtures.
+            ini = ConfigParser(interpolation=None)
+            try:
+                with conf.open(encoding="utf-8-sig") as stream:
+                    ini.read_file(stream)
+            except FileNotFoundError:
+                pass
+            if ini.get(C.DEFAULT_REMOTE, "type", fallback="") == "webdav":
+                url = ini.get(C.DEFAULT_REMOTE, "url")
+                if expected_url and url.rstrip("/") != expected_url.rstrip("/"):
+                    raise ValueError("rclone 的 WebDAV 地址与当前连接配置不一致")
+                endpoint = webdav_url(url)
+                if endpoint.scheme == "https" and (pem := self.config.trusted_certificate_for(url)):
+                    root = resources.enter_context(tempfile.TemporaryDirectory(prefix="PhoneNAS-tls-"))
+                    certificate = Path(root) / "trusted-server.pem"
+                    certificate.write_text(trusted_leaf(pem), encoding="ascii")
+                    proxy = resources.enter_context(https_endpoint_proxy(endpoint))
+                    flags.extend(("--ca-cert", str(certificate), "--http-proxy", proxy))
+        return [str(exe), *args, *flags, "--config", str(conf)]
 
     def run(
         self, args: list[str], timeout: int = 120, conf_path: Path | None = None,
         cancel_event: threading.Event | None = None,
+    ) -> Result:
+        return self._run(args, timeout, conf_path or self.conf_path, cancel_event, expected_url=self.config.url)
+
+    def _run(
+        self, args: list[str], timeout: int, conf: Path, cancel_event: threading.Event | None, *, expected_url: str,
     ) -> Result:
         if self._cancelled.is_set() or (cancel_event and cancel_event.is_set()):
             return Result(False, "", "操作已取消", -1)
         exe = rclone_exe()
         if not exe.exists():
             return Result(False, "", f"找不到 rclone: {exe}", -1)
-        conf = conf_path or self.conf_path
-        cmd = self._command(exe, args, conf)
+        resources = ExitStack()
         proc = None
         try:
+            cmd = self._command(exe, args, conf, resources, expected_url=expected_url)
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, encoding="utf-8", errors="replace", env=_file_environment(args),
+                text=True, encoding="utf-8", errors="replace", env=_environment(),
                 creationflags=CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
             with self._lock:
@@ -119,47 +147,47 @@ class Rclone:
         except Exception as exc:  # noqa: BLE001
             return Result(False, "", str(exc), -1)
         finally:
-            if proc is not None:
-                with self._lock:
-                    self._processes.discard(proc)
-                if proc.poll() is None:
-                    proc.kill()
-                    proc.communicate()
+            try:
+                if proc is not None:
+                    with self._lock:
+                        self._processes.discard(proc)
+                    if proc.poll() is None:
+                        proc.kill()
+                        proc.communicate()
+            finally:
+                resources.close()
 
     def popen(self, args: list[str], log_path: Path | None = None, conf_path: Path | None = None) -> subprocess.Popen:
         exe = rclone_exe()
         if not exe.exists():
             raise FileNotFoundError(f"找不到 rclone: {exe}")
         conf = conf_path or self.conf_path
-        cmd = self._command(exe, args, conf)
-        stream = None
-        if log_path:
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            stream = open(log_path, "a", encoding="utf-8", errors="replace")
-        try:
+        with ExitStack() as resources:
             if self._cancelled.is_set():
                 raise RuntimeError("操作已取消")
-            proc = subprocess.Popen(
-                cmd, stdout=stream or subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, encoding="utf-8", errors="replace", env=_file_environment(args),
-                creationflags=CREATE_NO_WINDOW if os.name == "nt" else 0,
-            )
-        except Exception:
-            if stream is not None:
-                stream.close()
-            raise
-        with self._lock:
-            self._processes.add(proc)
-        if stream is not None:
-            proc._phonenas_log = stream  # type: ignore[attr-defined]
+            cmd = self._command(exe, args, conf, resources, expected_url=self.config.url)
+            stream = None
+            if log_path:
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                stream = resources.enter_context(log_path.open("a", encoding="utf-8", errors="replace"))
+            with self._lock:
+                if self._cancelled.is_set():
+                    raise RuntimeError("操作已取消")
+                proc = subprocess.Popen(
+                    cmd, stdout=stream or subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, encoding="utf-8", errors="replace", env=_environment(),
+                    creationflags=CREATE_NO_WINDOW if os.name == "nt" else 0,
+                )
+                self._processes.add(proc)
+                proc._phonenas_resources = resources.pop_all()  # type: ignore[attr-defined]
         return proc
 
     def release(self, proc: subprocess.Popen) -> None:
         with self._lock:
             self._processes.discard(proc)
-        stream = getattr(proc, "_phonenas_log", None)
-        if stream is not None:
-            stream.close()
+        resources = getattr(proc, "_phonenas_resources", None)
+        if resources is not None:
+            resources.close()
 
     def obscure(self, password: str) -> str:
         if not password:
@@ -173,8 +201,9 @@ class Rclone:
         self._write_conf(self.conf_path, url, username, password)
 
     def _write_conf(self, path: Path, url: str, username: str, password: str) -> None:
-        if any(c in str(value) for value in (url, username, password) for c in ("\r", "\n", "\0")):
+        if any(ord(c) < 32 or ord(c) == 127 for value in (username, password) for c in value):
             raise ValueError("连接信息不能包含换行或控制字符")
+        webdav_url(url)
         obscured = self.obscure(password)
         lines = [
             f"[{C.DEFAULT_REMOTE}]",
@@ -212,10 +241,10 @@ class Rclone:
         try:
             with self.isolated_conf():
                 self._write_conf(self.conf_path, url, username, password)
-                return self.run(
+                return self._run(
                     ["lsd", f"{C.DEFAULT_REMOTE}:", "--max-depth", "1", "--timeout", "20s",
                      "--contimeout", "10s", "--retries", "1", "--low-level-retries", "1"],
-                    timeout=35, cancel_event=cancel_event,
+                    35, self.conf_path, cancel_event, expected_url=url,
                 )
         except Exception as exc:  # noqa: BLE001
             return Result(False, "", str(exc), -1)

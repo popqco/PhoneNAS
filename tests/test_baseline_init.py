@@ -96,9 +96,9 @@ class BaselineInitializationTests(unittest.TestCase):
         self.config.set("nas.username", "test-only")
         self.client = RecordingRclone(self.config, conf_path=conf)
 
-    def engine(self, task=None, *, lease_factory=None):
+    def engine(self, task=None, *, lease_factory=None, operation=""):
         task = task or self.task
-        return SyncEngine(self.client, task, state_directory=self.state,
+        return SyncEngine(self.client, task, state_directory=self.state, operation=operation,
                           lease_factory=lease_factory or (lambda: LocalDatasetLease(self.remote, task)))
 
     def store(self, task=None):
@@ -330,22 +330,24 @@ class BaselineInitializationTests(unittest.TestCase):
         self.assertIsNone(self.store().load())
         self.assertTrue(lock.exists(), "unknown metadata outcome must retain the protective lock")
         self.assertEqual(self.payload(), before)
-        # This is fixture cleanup only, never automatic production lock recovery.
-        (lock / "owner.json").unlink()
-        lock.rmdir()
-        metadata_path.unlink()
         self.client.intercept = None
-        original_rmdir = os.rmdir
+        recovery = self.engine(operation="recover")
+        recovery.execute(recovery.preview())
+        self.assertFalse(lock.exists())
+        metadata_path.unlink()  # Reset only the test's intentionally inconsistent metadata.
+        original_unlink = Path.unlink
         def fail_lock_release(path, *args, **kwargs):
-            if Path(path) == lock:
+            if path == lock / "owner.json":
                 raise OSError("simulated lock release failure")
-            return original_rmdir(path, *args, **kwargs)
-        with patch("os.rmdir", side_effect=fail_lock_release):
+            return original_unlink(path, *args, **kwargs)
+        with patch.object(Path, "unlink", fail_lock_release):
             with self.assertRaisesRegex(RuntimeError, "锁"):
                 engine.initialize_baseline(approved)
         self.assertIsNone(self.store().load(), "lease cleanup failure cannot persist a baseline")
         self.assertTrue(lock.exists())
-        lock.rmdir()  # Fixture cleanup of the intentionally unreleasable empty lock.
+        recovery = self.engine(operation="recover")
+        recovery.execute(recovery.preview())
+        self.assertFalse(lock.exists())
         approved = engine.preview_baseline_initialization()
         original_replace = os.replace
         def fail_local_save(source, destination):

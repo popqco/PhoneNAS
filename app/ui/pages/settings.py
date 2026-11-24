@@ -5,7 +5,6 @@ import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, cast
-from urllib.parse import urlsplit
 
 from PySide6.QtCore import QEvent, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtWidgets import (
@@ -29,6 +28,7 @@ from app.core.autostart import set_autostart
 from app.core.config import Config
 from app.core.rclone import Rclone
 from app.core.tasks import validate_tasks
+from app.core.tls import certificate_fingerprint, read_trusted_leaf, webdav_url
 from app.ui.widgets import Card, button, label
 
 
@@ -37,6 +37,7 @@ class _ConnectionInput:
     url: str
     username: str
     password: str
+    server_certificate: str = ""
 
 
 @dataclass(frozen=True)
@@ -198,32 +199,122 @@ def _scroll(content: QWidget) -> QScrollArea:
     return scroll
 
 
+class _ServerCertificateInput(QWidget):
+    """A local, explicit certificate selection bound to the address entered now."""
+
+    changed = Signal()
+
+    def __init__(self, address: QLineEdit, config: Config):
+        super().__init__()
+        self.address = address
+        self._endpoint = ""
+        self._pem = ""
+        self._needs_review = False
+        self.setObjectName("serverCertificate")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(7)
+        self.summary = label("", "small")
+        self.summary.setTextFormat(Qt.TextFormat.PlainText)
+        self.summary.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.summary.setWordWrap(True)
+        layout.addWidget(self.summary)
+        row = QHBoxLayout()
+        self.choose = button("选择已核对的证书…", "subtle")
+        self.clear = button("移除自定义证书", "subtle")
+        row.addWidget(self.choose)
+        row.addWidget(self.clear)
+        row.addStretch(1)
+        layout.addLayout(row)
+        self.choose.clicked.connect(self._choose)
+        self.clear.clicked.connect(self._clear)
+        self.address.textChanged.connect(self._refresh)
+        self.load(config)
+
+    @property
+    def endpoint(self) -> str:
+        return self.address.text().strip().rstrip("/")
+
+    @property
+    def certificate(self) -> str:
+        return self._pem if self.endpoint == self._endpoint else ""
+
+    def load(self, config: Config) -> None:
+        self._endpoint, self._pem = config.certificate_enrollment
+        self._needs_review = config.connection_needs_confirmation
+        self._refresh()
+
+    def _refresh(self) -> None:
+        pem = self.certificate
+        self.clear.setEnabled(bool(pem))
+        if pem:
+            status = "连接待确认 · " if self._needs_review else ""
+            text = f"{status}指定服务器证书 · SHA-256\n{certificate_fingerprint(pem)}"
+        elif self._pem and self._needs_review:
+            text = f"已保留本机证书。输入并确认原地址后可恢复使用：\n{self._endpoint}"
+        else:
+            text = "HTTPS 默认使用系统证书验证。手机自签名证书请从手机端导出公开证书，并比对手机显示的 SHA-256。"
+        self.summary.setText(text)
+
+    def _choose(self) -> None:
+        if not _operational(self):
+            return
+        endpoint = self.endpoint
+        try:
+            if webdav_url(endpoint).scheme != "https":
+                raise ValueError("请先填写证书对应的 HTTPS WebDAV 地址")
+            path, _ = QFileDialog.getOpenFileName(
+                self, "选择手机导出的公开服务器证书", "", "证书 (*.crt *.cer *.pem)",
+            )
+            if not path or not self.isEnabled() or not _operational(self) or self.endpoint != endpoint:
+                return
+            pem = read_trusted_leaf(Path(path))
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "无法选择服务器证书", str(exc))
+            return
+        confirmed = QMessageBox.question(
+            self, "核对服务器证书 SHA-256",
+            "请直接在手机端核对“证书 SHA-256”。不要使用从连接错误或未经验证的网络获取的证书。\n\n"
+            f"{endpoint}\n{certificate_fingerprint(pem)}\n\n忽略大小写和冒号后，确认所有字符一致？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No,
+        )
+        if (confirmed == QMessageBox.StandardButton.Yes and self.isEnabled()
+                and _operational(self) and self.endpoint == endpoint):
+            self._endpoint, self._pem = endpoint, pem
+            self._refresh()
+            self.changed.emit()
+
+    def _clear(self) -> None:
+        if _operational(self):
+            self._endpoint = self._pem = ""
+            self._refresh()
+            self.changed.emit()
+
+
 def _validate_connection(request: _ConnectionInput) -> None:
-    if any(ord(char) < 32 for char in request.url + request.username + request.password):
-        raise ValueError("地址、用户名和密码不能包含换行或控制字符")
-    try:
-        parsed = urlsplit(request.url)
-        port = parsed.port
-    except ValueError as exc:
-        raise ValueError(f"WebDAV 地址无效：{exc}") from exc
-    if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        raise ValueError("请输入完整的 WebDAV 地址，以 http:// 或 https:// 开头并包含主机名")
-    if parsed.username is not None or parsed.password is not None:
-        raise ValueError("请在下方填写账号和密码，不要把凭据放进 WebDAV 地址")
-    if parsed.query or parsed.fragment or any(char.isspace() for char in request.url):
-        raise ValueError("WebDAV 地址不能包含空白、查询参数或片段")
-    if port is not None and port < 1:
-        raise ValueError("WebDAV 端口必须为 1–65535")
+    if any(ord(char) < 32 or ord(char) == 127 for char in request.username + request.password):
+        raise ValueError("用户名和密码不能包含换行或控制字符")
+    webdav_url(request.url)
 
 
-def _write_connection(config: Config, request: _ConnectionInput) -> None:
+def _stage_connection(config: Config, request: _ConnectionInput, *, confirm_review: bool) -> bool:
     _validate_connection(request)
-    changed_target = (config.url, config.username) != (request.url, request.username)
+    needs_review = getattr(config, "connection_needs_confirmation", False)
+    if needs_review and not confirm_review:
+        raise ValueError("请先在设置页核对手机的 WebDAV 地址和账号")
     config.set("nas.url", request.url)
     config.set("nas.username", request.username)
+    config.set_trusted_certificate(request.url, request.server_certificate)
+    return config.confirm_connection() if needs_review else False
+
+
+def _write_connection(config: Config, request: _ConnectionInput, *, confirm_review: bool = False) -> None:
+    changed_target = (config.url, config.username) != (request.url, request.username)
+    needs_review = getattr(config, "connection_needs_confirmation", False)
+    restores_binding = _stage_connection(config, request, confirm_review=confirm_review)
     if request.password:
         config.password = request.password
-    if changed_target:
+    if (changed_target or needs_review) and not restores_binding:
         config.replace_tasks(
             replace(task, last_sync_at="", last_file_count=0, sync_identity=uuid.uuid4().hex)
             for task in config.tasks
@@ -231,21 +322,21 @@ def _write_connection(config: Config, request: _ConnectionInput) -> None:
 
 
 def _test_connection(
-    worker: _OperationThread, snapshot: Config, request: _ConnectionInput
+    worker: _OperationThread, snapshot: Config, request: _ConnectionInput, *, confirm_review: bool = False,
 ) -> _ConnectionResult:
     worker._secrets.append(request.password)
-    _validate_connection(request)
+    worker.check_cancelled()
+    # Stage the reviewed target and trust on this test's private, unsaved config.
+    _stage_connection(snapshot, request, confirm_review=confirm_review)
     worker.check_cancelled()
     password = request.password or snapshot.password
     worker._secrets.append(password)
     client = Rclone(snapshot)
     worker.attach_client(client)
-    # Neither testing nor saving touches the mounted client's shared conf.
-    with client.isolated_conf():
-        worker.check_cancelled()
-        result = client.test_connection(
-            request.url, request.username, password, cancel_event=worker.cancel_event
-        )
+    worker.check_cancelled()
+    result = client.test_connection(
+        request.url, request.username, password, cancel_event=worker.cancel_event
+    )
     worker.check_cancelled()
     if result.ok:
         return _ConnectionResult(True, "连接成功 · 已验证 WebDAV，输入尚未保存")
@@ -367,8 +458,11 @@ class SettingsPage(QWidget, _AsyncOperations):
         body.setContentsMargins(0, 0, 4, 0)
         body.setSpacing(16)
         connection, connection_layout = _card("NAS 连接", "填写手机 WebDAV 的地址和账号。密码只保存在本机，不随配置导出。")
+        self.connection_review_label = label("旧配置的连接信息有缺失。请在手机端核对 WebDAV 地址和账号后再确认保存。", "bodyMuted")
+        self.connection_review_label.setWordWrap(True)
+        connection_layout.addWidget(self.connection_review_label)
         self.url_edit = QLineEdit()
-        self.url_edit.setPlaceholderText("http://手机地址:端口/路径")
+        self.url_edit.setPlaceholderText("https://手机地址:端口/路径")
         self.user_edit = QLineEdit()
         self.pass_edit = QLineEdit()
         self.pass_edit.setEchoMode(QLineEdit.EchoMode.Password)
@@ -379,6 +473,8 @@ class SettingsPage(QWidget, _AsyncOperations):
         credentials.addLayout(_field("用户名", self.user_edit), 1)
         credentials.addLayout(_field("密码", self.pass_edit), 1)
         connection_layout.addLayout(credentials)
+        self.certificate_input = _ServerCertificateInput(self.url_edit, config)
+        connection_layout.addWidget(self.certificate_input)
         test_row = QHBoxLayout()
         self.test_button = button("测试连接", glyph="link")
         self.test_label = label("尚未测试当前输入", "muted")
@@ -462,7 +558,7 @@ class SettingsPage(QWidget, _AsyncOperations):
         root.addLayout(actions)
 
         self._editors = (
-            self.url_edit, self.user_edit, self.pass_edit, self.drive_combo,
+            self.url_edit, self.user_edit, self.pass_edit, self.certificate_input, self.drive_combo,
             self.mount_check, self.read_only_check, self.network_check, self.auto_mount_check,
             self.autostart_check, self.tray_check, self.mirror_enabled_check,
         )
@@ -475,6 +571,7 @@ class SettingsPage(QWidget, _AsyncOperations):
         self.winfsp_button.clicked.connect(self._install_winfsp)
         for edit in (self.url_edit, self.user_edit, self.pass_edit):
             edit.textChanged.connect(self._connection_edited)
+        self.certificate_input.changed.connect(self._connection_edited)
         self.load()
 
     def load(self) -> None:
@@ -482,6 +579,7 @@ class SettingsPage(QWidget, _AsyncOperations):
         self.url_edit.setText(self.config.url)
         self.user_edit.setText(self.config.username)
         self.pass_edit.clear()
+        self.certificate_input.load(self.config)
         self.drive_combo.setCurrentText(self.config.get("mount.drive", C.DEFAULT_DRIVE))
         self.mount_check.setChecked(bool(self.config.get("mount.enabled", True)))
         self.read_only_check.setChecked(bool(self.config.get("mount.read_only", True)))
@@ -496,12 +594,13 @@ class SettingsPage(QWidget, _AsyncOperations):
             if error else ""
         )
         self.load_error_label.setVisible(bool(error))
+        self.connection_review_label.setVisible(getattr(self.config, "connection_needs_confirmation", False))
         self._refresh_controls()
 
     def _connection_input(self) -> _ConnectionInput:
         return _ConnectionInput(
-            self.url_edit.text().strip().rstrip("/"),
-            self.user_edit.text().strip(), self.pass_edit.text(),
+            self.certificate_input.endpoint, self.user_edit.text().strip(), self.pass_edit.text(),
+            self.certificate_input.certificate,
         )
 
     def _connection_edited(self) -> None:
@@ -550,6 +649,31 @@ class SettingsPage(QWidget, _AsyncOperations):
             self._refresh_controls()
         return result
 
+    def _review_choice(self, request: _ConnectionInput, *, saving: bool) -> QMessageBox.StandardButton:
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Warning)
+        dialog.setWindowTitle("复核旧配置的连接")
+        dialog.setTextFormat(Qt.TextFormat.PlainText)
+        dialog.setText("请与手机端的 WebDAV 设置核对后再使用此连接。\n\n"
+                       f"地址：{request.url or '（空）'}\n账号：{request.username or '（空）'}")
+        options = QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        default = QMessageBox.StandardButton.No
+        if saving:
+            options |= QMessageBox.StandardButton.Cancel
+            default = QMessageBox.StandardButton.Cancel
+            dialog.setInformativeText("若有未完成操作，请填写当时使用的地址和账号，以保留原任务绑定。")
+        else:
+            dialog.setInformativeText("测试会使用当前密码；留空时使用已保存的密码。测试结束后仍需确认保存连接。")
+        dialog.setStandardButtons(options)
+        dialog.button(QMessageBox.StandardButton.Yes).setText("确认并保存连接" if saving else "确认并测试")
+        dialog.button(QMessageBox.StandardButton.No).setText("仅保存其他设置" if saving else "返回")
+        dialog.setDefaultButton(default)
+        dialog.setEscapeButton(default)
+        try:
+            return QMessageBox.StandardButton(dialog.exec())
+        finally:
+            dialog.deleteLater()
+
     def save(self) -> None:
         if not self._guard_operation():
             return
@@ -563,11 +687,19 @@ class SettingsPage(QWidget, _AsyncOperations):
             self.tray_check.isChecked(), self.mirror_enabled_check.isChecked(),
             read_only=self.read_only_check.isChecked(),
         )
+        needs_review = getattr(self.config, "connection_needs_confirmation", False)
+        write_connection = True
+        if needs_review:
+            answer = self._review_choice(request.connection, saving=True)
+            if answer not in (QMessageBox.StandardButton.Yes, QMessageBox.StandardButton.No) or not self._guard_operation():
+                return
+            write_connection = answer == QMessageBox.StandardButton.Yes
         draft = self.config.snapshot()
 
         def save_config(worker: _OperationThread) -> _SavedSettings:
-            worker._secrets.append(request.connection.password)
-            _write_connection(draft, request.connection)
+            if write_connection:
+                worker._secrets.append(request.connection.password)
+                _write_connection(draft, request.connection, confirm_review=needs_review)
             for key, value in (
                 ("mount.drive", request.drive), ("mount.enabled", request.mount_enabled),
                 ("mount.read_only", request.read_only),
@@ -598,7 +730,9 @@ class SettingsPage(QWidget, _AsyncOperations):
         self.config.apply_snapshot(result.config)
         self.load()
         self.saved.emit()
-        text = "已保存。网络盘将在当前任务空闲后应用新设置。"
+        text = ("已保存其他设置。请核对手机的 WebDAV 地址和账号后再确认连接。"
+                if getattr(self.config, "connection_needs_confirmation", False) else
+                "已保存。网络盘将在当前任务空闲后应用新设置。")
         if result.autostart_message:
             text += f"\n{'开机自启：' if result.autostart_ok else '开机自启未能更新：'}{result.autostart_message}"
         _feedback(self.notice_label, text, "good" if result.autostart_ok else "error")
@@ -616,9 +750,15 @@ class SettingsPage(QWidget, _AsyncOperations):
         if not self._guard_operation():
             return
         request = self._connection_input()
+        needs_review = getattr(self.config, "connection_needs_confirmation", False)
+        if needs_review and (self._review_choice(request, saving=False) != QMessageBox.StandardButton.Yes
+                             or not self._guard_operation()):
+            return
         snapshot = self.config.snapshot()
         _feedback(self.test_label, "正在连接…请等待本次测试结束")
-        self._start_operation("test", lambda worker: _test_connection(worker, snapshot, request), self._tested)
+        self._start_operation(
+            "test", lambda worker: _test_connection(worker, snapshot, request, confirm_review=needs_review), self._tested,
+        )
 
     def _tested(self, worker: _OperationThread) -> None:
         cancelled = worker.cancelled or worker.cancel_event.is_set()
@@ -725,7 +865,10 @@ class SettingsPage(QWidget, _AsyncOperations):
         self.config.apply_snapshot(cast(Config, worker.result))
         self.load()
         self.saved.emit()
-        _feedback(self.notice_label, "已导入合法配置。网络盘将在空闲后应用；请确认密码和任务设置，开机自启可在保存后应用。", "good")
+        text = ("已导入配置。请核对手机的 WebDAV 地址和账号后再确认连接。"
+                if getattr(self.config, "connection_needs_confirmation", False) else
+                "已导入合法配置。网络盘将在空闲后应用；请确认密码和任务设置，开机自启可在保存后应用。")
+        _feedback(self.notice_label, text, "good")
 
     def closeEvent(self, event) -> None:  # noqa: N802
         if self.shutdown():

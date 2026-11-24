@@ -8,6 +8,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from PySide6.QtCore import QThread, Signal
 
@@ -20,6 +21,21 @@ from app.core.rclone import Rclone
 from app.core.retention import old_versions, version_timestamp
 from app.core.tasks import MirrorTask, validate_source, validate_tasks
 from app.core.winpath import staging_directory
+
+if TYPE_CHECKING:
+    from app.core.relay import ContentSnapshot
+
+
+@dataclass(frozen=True)
+class _SyncPlan:
+    local: ContentSnapshot
+    remote: ContentSnapshot
+    metadata: dict | None
+    source: ContentSnapshot
+    destination: ContentSnapshot
+    marks: dict[str, str]
+    protocol: int
+    backup: ContentSnapshot | None
 
 
 @dataclass(frozen=True)
@@ -68,6 +84,15 @@ class SyncReport:
     @property
     def summary(self) -> str:
         return f"新增 {self.added} · 更新 {self.updated} · 删除 {self.deleted} · 未变化 {self.unchanged}"
+
+
+@dataclass(frozen=True)
+class _LockReleasePlan:
+    report: SyncReport
+    token: str
+    dataset: bool
+    registration: bool
+    control_only: bool
 
 
 def parse_sync_report(text: str) -> SyncReport:
@@ -170,7 +195,7 @@ class SyncEngine:
         if self.operation == "adopt" and task.direction != "upload":
             raise ValueError("只有发布任务需要接收交回的手机更新")
         self.lease_factory = lease_factory
-        self._plan = None
+        self._plan: _SyncPlan | None = None
 
     def _emit_progress(self, event: SyncProgress) -> None:
         self._current_progress = event
@@ -322,19 +347,20 @@ class SyncEngine:
             generation=generation,
         )
 
-    def _baseline_initialization_state(self, *, check_lock: bool = True):
+    def _baseline_initialization_state(self, *, owned_token: str = ""):
         from app.core.pending import PendingOperation
         from app.core.relay import verify_remote_scope
         self._stage("inspect_control", "正在核对首次基线的连接、保护锁与发布状态…")
         self._validate()
         store, coordinator = self._context()
-        if PendingOperation(store).load() is not None:
-            raise RuntimeError("本机有未完成的操作，不能初始化共同基线。")
-        if check_lock and coordinator.locked():
+        pending = PendingOperation(store).load()
+        if pending is not None and (pending["operation"], pending["lock_token"]) != ("initialize_baseline", owned_token):
+            raise RuntimeError("本机有未完成的操作，请先核对续作。")
+        if not owned_token and coordinator.locked():
             raise RuntimeError("数据集锁已占用；不会初始化共同基线或接管旧锁。")
         metadata = coordinator.read()
         if metadata is None:
-            verify_remote_scope(self.rclone, self.task, cancelled=self.cancelled)
+            verify_remote_scope(self.rclone, self.task, registering=True, cancelled=self.cancelled)
         elif metadata["phase"] != "ready":
             raise RuntimeError("手机数据集有未完成的发布，不能初始化共同基线。")
         # Adoption operates on existing trees, so an unmarked tree stays v1.
@@ -367,6 +393,7 @@ class SyncEngine:
         self, approved: BaselineInitializationPreview,
     ) -> BaselineInitializationResult:
         """Initialize control state and a local baseline, never transfer payloads."""
+        from app.core.pending import PendingOperation
         from app.core.relay import verify_remote_scope
 
         if type(approved) is not BaselineInitializationPreview:
@@ -374,8 +401,11 @@ class SyncEngine:
         fresh, store, coordinator, _, _, _, _, _ = self._baseline_initialization_state()
         if fresh != approved:
             raise RuntimeError("首次基线的内容、连接或范围已变化，请重新预览后确认。")
-        with coordinator.lease() as lease:
-            fresh, store, coordinator, _, remote, metadata, baseline, protocol = self._baseline_initialization_state(check_lock=False)
+        journal = PendingOperation(store)
+        with coordinator.control_lease(journal, "initialize_baseline", registering=not fresh.generation) as lease:
+            fresh, store, coordinator, _, remote, metadata, baseline, protocol = (
+                self._baseline_initialization_state(owned_token=lease.token)
+            )
             if fresh != approved:
                 raise RuntimeError("首次基线的内容、连接或范围已变化，请重新预览后确认。")
             created_metadata = metadata is None
@@ -389,7 +419,7 @@ class SyncEngine:
             try:
                 if created_metadata:
                     with coordinator.registration_lease(lease):
-                        verify_remote_scope(self.rclone, self.task, cancelled=self.cancelled)
+                        verify_remote_scope(self.rclone, self.task, registering=True, cancelled=self.cancelled)
                         started = True
                         coordinator.write("ready", generation, content_digest=remote.digest, protocol=protocol)
                 if coordinator.read() != expected:
@@ -397,7 +427,7 @@ class SyncEngine:
                 # Read both full trees again after the ready response: metadata
                 # success alone cannot establish a trustworthy content baseline.
                 verified, final_store, _, _, final_remote, final_metadata, final_baseline, final_protocol = (
-                    self._baseline_initialization_state(check_lock=False)
+                    self._baseline_initialization_state(owned_token=lease.token)
                 )
                 if (verified.binding_digest != approved.binding_digest
                         or final_store.path != store.path
@@ -440,8 +470,8 @@ class SyncEngine:
         if check_lock and self.recovering and not self.receiving and not coordinator.locked():
             raise RuntimeError("上次发布的所有权锁已缺失，不能证明仍由原操作独占；请先保留两端文件并核对。")
         metadata = coordinator.read()
-        if metadata is None and not self.receiving:
-            verify_remote_scope(self.rclone, self.task, cancelled=self.cancelled)
+        if metadata is None and not self.receiving and not self.recovering:
+            verify_remote_scope(self.rclone, self.task, registering=True, cancelled=self.cancelled)
         protocol, baseline, conflict = self._verify_protocol(store, metadata, pending)
         allow_missing = not self.receiving and self.operation == "publish"
         local = self._snapshot("inspect_local", "正在校验本地文件内容…",
@@ -572,16 +602,91 @@ class SyncEngine:
             digest=token, operation=self.operation, blocked=blocked, reason=reason,
             requires_confirmation=bool(reason) and not blocked,
         )
-        self._plan = (local, remote, metadata, source, destination, marks, protocol, backup)
+        self._plan = _SyncPlan(local=local, remote=remote, metadata=metadata, source=source,
+                               destination=destination, marks=marks, protocol=protocol, backup=backup)
         self._stage("difference", report.summary)
         return report
 
+    def _plan_lock_release(self, journal, coordinator, pending) -> _LockReleasePlan | None:
+        from app.core.pending import CONTROL_OPERATIONS
+
+        operation = pending["operation"]
+        control_only = operation in CONTROL_OPERATIONS
+        if not control_only and (operation not in ("publish", "return") or pending.get("prior_metadata") is not None):
+            return None
+        token = pending["lock_token"]
+        dataset, registration = coordinator.owned_locks(token, registration=pending.get("registration", not control_only))
+        if registration and not dataset:
+            raise RuntimeError("目录登记锁仍在，但无法确认对应的数据集锁；请保留记录。")
+        if control_only:
+            reason = f"{CONTROL_OPERATIONS[operation]}：核对并释放本机留下的保护锁，只处理控制记录。"
+        elif registration:
+            reason = "只释放本机的目录登记锁，让其他任务可继续登记。保留此任务的数据集锁和文件续作记录。"
+        else:
+            return None
+        reason += "请确认原操作已停止；不会重传文件或清理历史。"
+        digest = _canonical_digest([journal.binding, "release", operation, token, pending.get("generation"),
+                                    pending.get("registration"), dataset, registration])
+        report = SyncReport(operation="release", digest=digest, reason=reason, requires_confirmation=True)
+        return _LockReleasePlan(report, token, dataset, registration, control_only)
+
     def preview(self) -> SyncReport:
-        return self._inspect()
+        if not self.recovering:
+            return self._inspect()
+        from app.core.pending import CONTROL_OPERATIONS, PendingOperation
+        store, coordinator = self._context()
+        journal = PendingOperation(store)
+        pending = journal.load()
+        if pending is None:
+            raise RuntimeError("没有可继续的未完成操作。")
+        if pending["operation"] in CONTROL_OPERATIONS:
+            release = self._plan_lock_release(journal, coordinator, pending)
+            assert release is not None
+            return release.report
+        try:
+            report = self._inspect()
+        except (OSError, ValueError, RuntimeError):
+            self._check_cancel()
+            if release := self._plan_lock_release(journal, coordinator, pending):
+                return release.report
+            raise
+        if report.blocked and (release := self._plan_lock_release(journal, coordinator, pending)):
+            return release.report
+        return report
+
+    def _execute_release(self, report: SyncReport) -> str:
+        from app.core.pending import PendingOperation
+
+        if not self.recovering or report.blocked:
+            raise RuntimeError("请先在原任务中明确确认保护锁恢复。")
+        store, coordinator = self._context()
+        journal = PendingOperation(store)
+        pending = journal.load()
+        plan = self._plan_lock_release(journal, coordinator, pending) if pending is not None else None
+        if plan is None or plan.report != report:
+            raise RuntimeError("保护锁或本机记录已变化，请重新核对后确认。")
+        self.begin_commit()
+        self.rclone.config.save_recovered_connection()
+        self._stage("releasing", "正在核对并处理本机的保护锁…")
+        if plan.dataset:
+            with coordinator.recorded_lease(coordinator.recovery_lease(plan.token), journal) as lease:
+                locked_plan = self._plan_lock_release(journal, coordinator, pending)
+                if locked_plan != plan:
+                    raise RuntimeError("保护锁已变化，请重新核对后确认。")
+                if plan.registration:
+                    coordinator.release_interrupted_registration(lease, required=True)
+                if not plan.control_only:
+                    lease.retain()
+        else:
+            journal.clear_control(plan.token)
+        return ""
 
     def execute(self, report: SyncReport) -> str:
         from app.core.history import _no_links
-        from app.core.relay import ContentSnapshot, verify_remote_scope
+        from app.core.relay import ContentSnapshot, DatasetLeaseRefused, verify_remote_scope
+
+        if report.operation == "release":
+            return self._execute_release(report)
 
         if report.blocked:
             raise RuntimeError(report.reason or "内容保护已阻止执行")
@@ -590,12 +695,14 @@ class SyncEngine:
         # In particular do not acquire a recovery lease on an incompatible v1
         # journal. Repeat the same proof under the lock before writing payloads.
         store, coordinator = self._context()
-        from app.core.pending import PendingOperation
+        from app.core.pending import CONTROL_OPERATIONS, PendingOperation
         journal = PendingOperation(store)
         interrupted = journal.load()
         if self.recovering:
             if interrupted is None:
                 raise RuntimeError("没有可继续的未完成操作。")
+            if interrupted["operation"] in CONTROL_OPERATIONS:
+                raise RuntimeError("文件操作已经结束，请重新核对保护锁收尾。")
             self.operation = interrupted["operation"]
             if self.operation != report.operation:
                 raise RuntimeError("操作方向与已确认差异不一致")
@@ -605,7 +712,8 @@ class SyncEngine:
         has_recovery_lock = interrupted is not None and coordinator.locked()
         if interrupted is not None and not self.receiving and not has_recovery_lock:
             raise RuntimeError("上次发布的所有权锁已缺失；请保留两端文件和未完成记录。")
-        protocol, _, conflict = self._verify_protocol(store, coordinator.read(), interrupted)
+        metadata = coordinator.read()
+        protocol, _, conflict = self._verify_protocol(store, metadata, interrupted)
         if conflict:
             raise RuntimeError(f"目标名称冲突，未写入文件：{conflict}")
         if interrupted is not None:
@@ -613,21 +721,36 @@ class SyncEngine:
             if history_conflict:
                 raise RuntimeError(history_conflict)
         recovery_token = interrupted["lock_token"] if interrupted else None
-        context = coordinator.recovery_lease(recovery_token) if has_recovery_lock else coordinator.lease()
+        context = (coordinator.recovery_lease(recovery_token) if has_recovery_lock
+                   else coordinator.lease(token=recovery_token))
         self._stage("locking", "正在获取数据集保护锁…")
-        with context as lease:
+        with coordinator.recorded_lease(context, journal) as lease:
             fresh = self._inspect(check_lock=False, recovery_token=recovery_token)
             if fresh.blocked:
                 raise RuntimeError(fresh.reason)
             if fresh.digest != report.digest:
                 raise RuntimeError("文件内容或发布批次已变化，请重新查看差异后确认。")
-            local, remote, metadata, source, destination, marks, protocol, backup = self._plan
-            if (metadata and metadata["phase"] == "ready" and local.same_content(remote)
+            if interrupted is not None:
+                self.rclone.config.save_recovered_connection()
+            plan = self._plan
+            assert plan is not None
+            metadata, protocol = plan.metadata, plan.protocol
+            if interrupted is not None and not self.receiving and interrupted.get("prior_metadata") is None:
+                # A payload approval must still match before its recovery can
+                # release the registration lock. A release-only plan is separate.
+                coordinator.release_interrupted_registration(lease)
+                if metadata is None:
+                    verify_remote_scope(self.rclone, self.task, registering=True, cancelled=self.cancelled)
+            source, destination, marks = plan.source, plan.destination, plan.marks
+            if (metadata and metadata["phase"] == "ready" and plan.local.same_content(plan.remote)
                     and set(source.directories).issubset(destination.directories)):
                 self._stage("saving", "文件内容没有变化；正在保存已核对的共同基线…")
                 self.begin_commit()
-                store.save(remote, metadata["generation"], protocol=protocol)
-                journal.clear()
+                if interrupted is None:
+                    journal.save_control("finalize", lease.token)
+                store.save(plan.remote, metadata["generation"], protocol=protocol)
+                if interrupted is not None:
+                    journal.save_control("finalize", lease.token)
                 self._stage("releasing", "共同基线已核对；正在释放任务锁…")
                 return ""
             self._stage("preparing_history", "正在核对历史批次位置…")
@@ -669,29 +792,54 @@ class SyncEngine:
                         raise RuntimeError(f"目标名称冲突，未写入文件：{conflict}")
                     if interrupted is not None:
                         recent, history_conflict = self._verify_recovery_history(interrupted, protocol)
-                        if history_conflict or recent.digest != backup.digest:
+                        assert plan.backup is not None
+                        if history_conflict or recent.digest != plan.backup.digest:
                             raise RuntimeError(history_conflict or "续作的历史批次已改变，未写入目标，请重新核对。")
                     elif self._namespace(history_root, allow_missing=True) is not None:
                         raise RuntimeError("本次历史批次位置已被占用，未写入目标，请重新核对。")
-                    if self.cancelled.is_set():
-                        raise RuntimeError("操作已取消")
+                    self._check_cancel()
                     registering = not self.receiving and metadata is None
                     registration = coordinator.registration_lease(lease) if registering else nullcontext()
-                    with registration:
-                        if registering:
-                            verify_remote_scope(self.rclone, self.task, cancelled=self.cancelled)
-                            if protocol == LITERAL and interrupted is None and self._new_protocol(store) != LITERAL:
-                                raise RuntimeError("首次发布的镜像、历史或本机状态已变化；未写入文件，请重新查看差异。")
-                        self._check_cancel()
-                        if not interrupted:
-                            journal.save(
-                                operation=self.operation, local=local, remote=remote,
-                                generation=generation, stamp=stamp, lock_token=lease.token,
-                                prior_metadata=metadata, protocol=protocol,
-                            )
-                        payload_started = True
-                        if not self.receiving:
-                            coordinator.write("publishing", generation, content_digest=source.digest, protocol=protocol)
+                    # Persist the token before acquiring the shared lock: a
+                    # process exit after registration must leave usable proof.
+                    if interrupted is None:
+                        journal.save(
+                            operation=self.operation, local=plan.local, remote=plan.remote,
+                            generation=generation, stamp=stamp, lock_token=lease.token,
+                            prior_metadata=metadata, protocol=protocol,
+                        )
+                    preflight_error = None
+                    try:
+                        with registration:
+                            try:
+                                if registering:
+                                    verify_remote_scope(self.rclone, self.task, registering=True, cancelled=self.cancelled)
+                                    if protocol == LITERAL and self._new_protocol(store) != LITERAL:
+                                        raise RuntimeError("首次发布的镜像、历史或本机状态已变化；未写入文件，请重新查看差异。")
+                                self._check_cancel()
+                            except Exception as exc:
+                                if interrupted is not None:
+                                    raise
+                                # Only discard the new intent after confirming
+                                # the registration lock was released cleanly.
+                                preflight_error = exc
+                            if preflight_error is None:
+                                payload_started = True
+                                if not self.receiving:
+                                    coordinator.write("publishing", generation, content_digest=source.digest, protocol=protocol)
+                    except DatasetLeaseRefused:
+                        if interrupted is None and not payload_started:
+                            journal.save_control("rejected", lease.token)
+                        raise
+                    except BaseException:
+                        if registering and interrupted is None:
+                            # An acquisition or release may have an unknown
+                            # outcome; preserve the dataset lock and its proof.
+                            lease.retain()
+                        raise
+                    if preflight_error is not None:
+                        journal.save_control("rejected", lease.token)
+                        raise preflight_error
                     self._stage("applying", "正在写入本地接收目录…" if self.receiving else "正在上传写入手机镜像…")
                     if not self.receiving:
                         self._require(self.rclone.mkdir(self.task.remote_path), "创建镜像目录失败")
@@ -727,7 +875,7 @@ class SyncEngine:
                     if not self.receiving:
                         coordinator.write("ready", generation, content_digest=verified.digest, protocol=protocol)
                     store.save(verified, generation, protocol=protocol)
-                    journal.clear()
+                    journal.save_control("finalize", lease.token)
             except Exception:
                 if payload_started and not self.receiving:
                     lease.retain()
@@ -737,7 +885,7 @@ class SyncEngine:
             # existing offline history on this computer. Local batches remain
             # available for explicit, verified deletion but are not auto-expired.
             if protocol == LITERAL and not self.receiving:
-                self._clean_history(coordinator, lease)
+                self._clean_history(coordinator, lease, journal)
             self._stage("releasing", "正在释放任务锁；尚未报告任务完成…")
             return stamp
 
@@ -839,24 +987,31 @@ class SyncEngine:
             if log_handle:
                 log_handle.close()
 
-    def _clean_history(self, coordinator, lease) -> None:
+    def _clean_history(self, coordinator, lease, journal) -> None:
         from app.core.history import HistoryService
         from app.core.relay import verify_remote_scope
 
         history = HistoryService(self.rclone, self.task, protocol=LITERAL)
+        failure = None
         try:
             expired = old_versions(history.list_versions(), self.task.retention_days)
             if not expired:
                 return
-            # The dataset lease protects the batch; the registration lease
-            # prevents another dataset claiming this archive during expiry.
+            journal.save_control("finalize", lease.token, registration=True)
             with coordinator.registration_lease(lease):
-                verify_remote_scope(self.rclone, self.task, require_ready=True, cancelled=self.cancelled)
-                for name in expired:
-                    self._validate()
-                    history.delete(name)
+                try:
+                    verify_remote_scope(self.rclone, self.task, require_ready=True, cancelled=self.cancelled)
+                    for name in expired:
+                        self._validate()
+                        history.delete(name)
+                except Exception as exc:
+                    failure = exc
         except Exception as exc:
-            self._stage("cleanup", f"文件内容已核验；历史清理未完成：{exc}")
+            if lease.retained:
+                raise RuntimeError(f"文件内容已核验；登记锁释放待确认，请续作核对：{exc}") from exc
+            failure = exc
+        if failure is not None:
+            self._stage("cleanup", f"文件内容已核验；历史清理未完成：{failure}")
 
 
 class SyncWorker(QThread):

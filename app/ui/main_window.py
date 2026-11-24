@@ -36,6 +36,7 @@ from app.ui.wizard import WizardDialog
 
 _SCHEDULE_APPROVAL = "1.2.4-filenames"
 _SCHEDULE_NOTICE = "文件名校验规则已更新，自动计划已暂停。请先核对任务差异，再点击「继续自动计划」。"
+_CONNECTION_NOTICE = "连接待确认。请前往「设置」核对连接地址和用户名，然后点击「保存设置」。"
 _SYNC_ALL_TEXT = "逐项核对并同步"
 _SYNC_ALL_TIP = "依次查看各个已启用任务的差异；确认后才执行，关闭预演会跳过该项。"
 
@@ -48,12 +49,13 @@ class MainWindow(QMainWindow):
         self.setProperty("safeMode", not operational)
         self.log = get_logger()
         self.mount = MountSupervisor(config, self)
-        self.scheduler = Scheduler(config.tasks if config.get("mirror.enabled", True) else (), self)
+        self.scheduler = Scheduler(self._scheduled_tasks(), self)
         self.sync_worker: SyncWorker | None = None
         self.states: dict[str, dict] = {}
         self.events: list[dict] = []
         self._preview_result: tuple[SyncReport, str] | None = None
         self._settings_pending = False
+        self._connection_pending = config.connection_needs_confirmation
         self._connection_signature = self._connection_settings()
         self._tray_hint_shown = False
         self._quitting = False
@@ -70,6 +72,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._build_tray()
         self._connect()
+        self._set_operation_gates()
         self.refresh_status()
         self._status_timer = QTimer(self)
         self._status_timer.setInterval(15000)
@@ -86,7 +89,7 @@ class MainWindow(QMainWindow):
                 QTimer.singleShot(200, self, self._show_config_error)
             elif self._first_run:
                 QTimer.singleShot(250, self, self.open_wizard)
-            else:
+            elif self._can_start():
                 QTimer.singleShot(400, self, self._start_automatic_mount)
                 QTimer.singleShot(2500, self, self._start_scheduler)
 
@@ -161,6 +164,9 @@ class MainWindow(QMainWindow):
         if not self.operational:
             top_layout.addWidget(Badge("界面检查 · 不连接手机", "blue"))
         body_layout.addWidget(top)
+        self._connection_notice = label(_CONNECTION_NOTICE, "bodyMuted")
+        self._connection_notice.setWordWrap(True)
+        body_layout.addWidget(self._connection_notice)
         self._schedule_notice = label(_SCHEDULE_NOTICE, "bodyMuted")
         self._schedule_notice.setWordWrap(True)
         body_layout.addWidget(self._schedule_notice)
@@ -173,25 +179,29 @@ class MainWindow(QMainWindow):
         self.sidebar.currentRowChanged.connect(self._nav_changed)
         self.sidebar.setCurrentRow(1)
         self.statusBar().setSizeGripEnabled(True)
-        self.statusBar().showMessage("就绪" if self.operational else "界面检查模式：不挂载、不执行同步、不读写正式配置")
+        initial_status = _CONNECTION_NOTICE if self._connection_pending else "就绪"
+        self.statusBar().showMessage(initial_status if self.operational else "界面检查模式：不挂载、不执行同步、不读写正式配置")
 
     def _build_tray(self) -> None:
         self.tray = None
+        self._tray_connection_actions: list[QAction] = []
         if not self.operational or not QSystemTrayIcon.isSystemTrayAvailable():
             return
         app_icon = QIcon(str(C.resource_path("app/resources/app.ico")))
         self.tray = QSystemTrayIcon(app_icon, self)
         menu = QMenu(self)
         actions = [
-            ("打开主界面", self.show_window),
-            (_SYNC_ALL_TEXT, self.run_sync),
-            ("挂载 / 卸载", self.toggle_mount),
-            ("暂停 / 继续自动计划", self.toggle_pause),
+            ("打开主界面", self.show_window, False),
+            (_SYNC_ALL_TEXT, self.run_sync, True),
+            ("挂载 / 卸载", self.toggle_mount, True),
+            ("暂停 / 继续自动计划", self.toggle_pause, True),
         ]
-        for text, slot in actions:
+        for text, slot, needs_connection in actions:
             action = QAction(text, self)
             action.triggered.connect(lambda _checked=False, callback=slot: callback())
             menu.addAction(action)
+            if needs_connection:
+                self._tray_connection_actions.append(action)
         menu.addSeparator()
         quit_action = QAction("退出", self)
         quit_action.triggered.connect(self.quit_app)
@@ -238,8 +248,11 @@ class MainWindow(QMainWindow):
     def _message(self, title: str, text: str, *, warning: bool = False) -> None:
         (QMessageBox.warning if warning else QMessageBox.information)(self, title, text)
 
-    def _can_start(self) -> bool:
+    def _can_manage(self) -> bool:
         return self.operational and not self._quitting and not self.config.load_error
+
+    def _can_start(self) -> bool:
+        return self._can_manage() and not self.config.connection_needs_confirmation
 
     def _allowed(self) -> bool:
         if self._quitting:
@@ -250,7 +263,15 @@ class MainWindow(QMainWindow):
         if self.config.load_error:
             self._message("配置无效", self.config.load_error, warning=True)
             return False
+        if self.config.connection_needs_confirmation:
+            self.statusBar().showMessage(_CONNECTION_NOTICE)
+            return False
         return True
+
+    def _scheduled_tasks(self) -> tuple[MirrorTask, ...]:
+        if self.config.connection_needs_confirmation or not self.config.get("mirror.enabled", True):
+            return ()
+        return self.config.tasks
 
     @property
     def _schedule_approved(self) -> bool:
@@ -400,10 +421,11 @@ class MainWindow(QMainWindow):
 
     def _reload_tasks(self) -> None:
         self._enforce_schedule_approval()
-        self.scheduler.update_tasks(self.config.tasks if self.config.get("mirror.enabled", True) else ())
+        self.scheduler.update_tasks(self._scheduled_tasks())
         self._start_scheduler()
         self.mirror_page.load()
         self.versions_page.load_tasks()
+        self._set_operation_gates()
         self.refresh_status()
 
     def run_sync(self, task_id: str | None = None) -> None:
@@ -502,8 +524,9 @@ class MainWindow(QMainWindow):
             approved_digest=approved_digest,
         )
         self.sync_worker = worker
-        self.states[task.id] = {"state": "preview" if preview_only else "running", "message": "正在校验差异…", "progress": None, "operation": worker.operation}
-        self.statusBar().showMessage(self.states[task.id]["message"])
+        message = "正在核对未完成操作与保护锁…" if worker.operation == "recover" else "正在校验差异…"
+        self.states[task.id] = {"state": "preview" if preview_only else "running", "message": message, "progress": None, "operation": worker.operation}
+        self.statusBar().showMessage(message)
         worker.progress.connect(self._on_progress)
         worker.progress_event.connect(self._on_progress_event)
         worker.finished_ok.connect(self._on_sync_ok)
@@ -557,6 +580,16 @@ class MainWindow(QMainWindow):
 
     def _on_sync_ok(self, task_id: str, report: SyncReport, stamp: str) -> None:
         self._progress_timer.stop()
+        if report.operation == "release":
+            title = "保护锁处理完成"
+            scope = "仅处理已核验的 PhoneNAS 保护记录；工作文件与历史文件保持原样。"
+            message = f"{title} · {scope}"
+            self.states[task_id] = {"state": "idle", "message": message, "progress": None, "operation": report.operation}
+            self.statusBar().showMessage(message)
+            task = self.config.get_task(task_id)
+            detail = " ".join(part for part in (scope, report.reason) if part)
+            self._event(task.name if task else task_id, title, "shield", detail)
+            return
         action = {"publish": "上传", "receive": "拉取", "return": "交回", "adopt": "接收手机更新"}.get(report.operation, "同步")
         message = f"{action}完成 · {report.summary}"
         self.states[task_id] = {"state": "idle", "message": message, "progress": None, "operation": report.operation}
@@ -595,9 +628,14 @@ class MainWindow(QMainWindow):
         if worker is None or worker.task.id != task_id or not worker.preview_only:
             return
         self._progress_timer.stop()
-        message = f"差异核对完成 · {report.summary}"
-        self.states[task_id] = {"state": "guarded" if reason else "idle", "message": reason if report.blocked else message, "progress": None, "operation": report.operation}
-        self.statusBar().showMessage(reason if report.blocked else message)
+        if report.operation == "release":
+            state = "guarded" if report.blocked else "idle"
+            message = (reason or report.reason or "保护锁未通过核对") if report.blocked else "保护锁核对完成 · 请查看操作范围"
+        else:
+            state = "guarded" if reason else "idle"
+            message = reason if report.blocked else f"差异核对完成 · {report.summary}"
+        self.states[task_id] = {"state": state, "message": message, "progress": None, "operation": report.operation}
+        self.statusBar().showMessage(message)
         self._preview_result = (report, reason)
         self.refresh_status()
 
@@ -606,10 +644,17 @@ class MainWindow(QMainWindow):
         if not self._exec_dialog(dialog) or report.blocked or not self._can_start():
             return False
         if (not report.digest or (operation != "recover" and report.operation != operation)
+                or (report.operation == "release" and (operation != "recover" or not report.requires_confirmation))
                 or not task.enabled or self.config.get_task(task.id) != task or self._settings_pending
                 or self.busy or not self.config.get("mirror.enabled", True)):
             self.statusBar().showMessage("任务或差异已变化，请重新核对后再执行。")
             return False
+        if operation == "recover":
+            try:
+                self.config.save_recovered_connection()
+            except (OSError, ValueError, RuntimeError) as exc:
+                self._message("暂未开始恢复", f"已核对的原连接未能保存；请保留续作记录：{exc}", warning=True)
+                return False
         queue = self.scheduler.queue
         if queue.active_id != task.id and not queue.claim(task.id):
             self.statusBar().showMessage("任务状态已变化，请重新核对后再执行。")
@@ -661,12 +706,12 @@ class MainWindow(QMainWindow):
         syncing = self.sync_worker is not None or self._wizard is not None or self._quitting
         self.settings_page.set_sync_busy(syncing or self.versions_page.busy)
         self.versions_page.set_sync_busy(syncing or self.settings_page.busy)
-        self.mirror_page.set_interaction_busy(self.busy or self._quitting)
+        self.mirror_page.set_interaction_busy(self.busy or self._quitting or self.config.connection_needs_confirmation)
 
     def _connection_settings(self) -> tuple:
         return tuple(self.config.get(key) for key in (
             "nas.url", "nas.username", "nas.password_enc", "mount.drive", "mount.network_mode", "mount.enabled", "mount.read_only",
-        ))
+        )) + (self.config.trusted_certificate_for(self.config.url),)
 
     def _on_settings_saved(self) -> None:
         self._settings_pending = True
@@ -675,20 +720,31 @@ class MainWindow(QMainWindow):
 
     def _apply_settings(self) -> None:
         self._settings_pending = False
-        if not self._can_start():
+        if not self._can_manage():
             return
-        self._reconcile_mount()
+        was_pending = self._connection_pending
+        pending = self.config.connection_needs_confirmation
+        self._connection_pending = pending
+        if pending and self.scheduler._started:
+            self.scheduler.stop()
+        self._reconcile_mount(auto_mount=was_pending and not pending)
         self._reload_tasks()
-        self._event("设置", "连接与任务配置已更新", "settings")
+        if pending:
+            self.statusBar().showMessage(_CONNECTION_NOTICE)
+        elif was_pending:
+            self.statusBar().showMessage("连接设置已确认")
+        self._event("设置", "已更新配置 · 连接待确认" if pending else "连接与任务配置已更新", "settings")
 
-    def _reconcile_mount(self, *, setup: bool = False) -> None:
+    def _reconcile_mount(self, *, auto_mount: bool = False) -> None:
         signature = self._connection_settings()
         changed = signature != self._connection_signature
         was_mounted = self.mount.state in ("mounted", "starting", "retrying")
-        if changed:
+        if changed or self.config.connection_needs_confirmation:
             self.mount.stop()
             self._connection_signature = signature
-        if setup:
+        if self.config.connection_needs_confirmation:
+            return
+        if auto_mount:
             if changed and was_mounted:
                 QTimer.singleShot(350, self, self._start_automatic_mount)
             else:
@@ -712,7 +768,7 @@ class MainWindow(QMainWindow):
             self.settings_page.load()
             self._reload_tasks()
             set_autostart(bool(self.config.get("app.start_with_windows", True)))
-            self._reconcile_mount(setup=True)
+            self._reconcile_mount(auto_mount=True)
 
     def toggle_mount(self) -> None:
         if not self._allowed():
@@ -785,20 +841,28 @@ class MainWindow(QMainWindow):
             next_runs[task.id] = due.strftime("%H:%M") if due else ""
         last = max((t.last_sync_at for t in self.config.tasks), default="")
         next_run = queue.next_run_at
+        connection_ready = self._can_start()
+        self._connection_notice.setVisible(self._can_manage() and self.config.connection_needs_confirmation)
         self._schedule_notice.setVisible(
-            self._can_start() and queue.paused and not self._schedule_approved
+            connection_ready and queue.paused and not self._schedule_approved
             and bool(self.config.get("mirror.enabled", True))
             and any(task.enabled and task.auto_sync for task in self.config.tasks)
         )
         self.status_page.set_nas(self.config.url)
         self.status_page.set_winfsp(winfsp.is_installed())
         self.status_page.set_mount(self.mount.state, self.mount.drive)
+        self.status_page.mount_button.setEnabled(connection_ready)
+        drive_available = connection_ready and self.mount.state == "mounted" and bool(self.mount.drive)
+        self.status_page.open_drive_button.setEnabled(drive_available)
         self.status_page.set_sync(last, next_run.strftime("%H:%M") if next_run else "", queue.paused)
         self.status_page.set_summary(
             self.config.tasks, runtime, len(queue.queued_ids),
-            sync_available=self.operational and not self.busy and not self._quitting and bool(self.config.get("mirror.enabled", True)),
+            sync_available=connection_ready and not self.busy and bool(self.config.get("mirror.enabled", True)),
         )
         self.mirror_page.set_runtime(runtime, next_runs, queue.paused, self.mount.state, self.mount.drive, self.events)
+        self.mirror_page.open_drive_button.setEnabled(drive_available)
+        for action in self._tray_connection_actions:
+            action.setEnabled(connection_ready)
         state_text = {"mounted": f"已挂载 {self.mount.drive}", "starting": "正在挂载", "retrying": "正在重试挂载", "error": "挂载失败", "stopped": "未挂载"}.get(self.mount.state, self.mount.state)
         self.top_badge.set_status(state_text, "good" if self.mount.state == "mounted" else "neutral")
         self.side_mount.setText(f"手机 NAS · {state_text}")

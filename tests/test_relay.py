@@ -3,7 +3,6 @@ from __future__ import annotations
 import io
 import json
 import os
-import ssl
 import tempfile
 import threading
 import unittest
@@ -15,8 +14,7 @@ from unittest.mock import patch
 from app.core.config import Config
 from app.core.rclone import Rclone, Result, rclone_exe
 from app.core.relay import (BaselineStore, ContentSnapshot, DatasetCoordinator,
-                            FileContent, LocalDatasetLease, _unverified_ssl_context,
-                            find_published_dataset, snapshot_tree)
+                            FileContent, LocalDatasetLease, find_published_dataset, snapshot_tree)
 from app.core.tasks import new_task
 
 
@@ -59,13 +57,6 @@ class ScriptedRclone:
         if not self.results:
             raise AssertionError(f"unexpected rclone operation: {args}")
         return self.results.pop(0)
-
-
-class TlsContextTests(unittest.TestCase):
-    def test_phone_self_signed_certificate_is_accepted_for_control_requests(self):
-        context = _unverified_ssl_context()
-        self.assertFalse(context.check_hostname)
-        self.assertEqual(context.verify_mode, ssl.CERT_NONE)
 
 
 class SnapshotTests(IsolatedTest):
@@ -700,6 +691,12 @@ class CoordinatorTests(IsolatedTest):
                     return Response(201)
                 if request.method == "GET":
                     return Response(200, json.dumps(owner).encode("utf-8"))
+                if request.method == "PROPFIND":
+                    from urllib.parse import urlsplit
+                    path = urlsplit(request.full_url).path
+                    body = "".join(f"<response><href>{name}</href></response>"
+                                   for name in (path, path + "owner.json"))
+                    return Response(207, f'<multistatus xmlns="DAV:">{body}</multistatus>'.encode())
                 if request.method == "DELETE":
                     return Response(204)
                 self.fail("unexpected HTTP method")
@@ -707,7 +704,7 @@ class CoordinatorTests(IsolatedTest):
             with DatasetCoordinator(client, task).lease():
                 client.results.clear()  # Cleanup cannot use a cancelled rclone instance.
         self.assertEqual(client.calls, [["mkdir", "phone:.phonenas/locks"]])
-        self.assertEqual([request.method for request in requests], ["MKCOL", "PUT", "GET", "DELETE"])
+        self.assertEqual([request.method for request in requests], ["MKCOL", "PUT", "GET", "PROPFIND", "DELETE"])
         self.assertEqual(requests[0].full_url,
                          f"https://example.invalid/base%20folder/.phonenas/locks/{task.dataset_id}/")
         self.assertEqual(owner["writer_identity"], task.sync_identity)
@@ -757,6 +754,7 @@ class CoordinatorTests(IsolatedTest):
         client = ScriptedRclone()
         client.config = config
         calls = []
+        foreign_record = False
         owners = {"primary": {"version": 1, "dataset_id": task.dataset_id,
                               "writer_identity": task.sync_identity, "token": token}}
         class Response(io.BytesIO):
@@ -778,6 +776,17 @@ class CoordinatorTests(IsolatedTest):
                 if request.method == "PUT":
                     owners[key] = json.loads(request.data)
                     return Response(201)
+                if request.method == "PROPFIND":
+                    from urllib.parse import urlsplit
+
+                    path = urlsplit(request.full_url).path
+                    paths = [path, path + "owner.json"]
+                    if not child:
+                        paths.append(path + "recovery/")
+                        if foreign_record:
+                            paths.append(path + "unrelated.json")
+                    body = "".join(f"<response><href>{name}</href></response>" for name in paths)
+                    return Response(207, f'<multistatus xmlns="DAV:">{body}</multistatus>'.encode())
                 if request.method == "DELETE":
                     if child:
                         owners.pop("child", None)
@@ -797,6 +806,12 @@ class CoordinatorTests(IsolatedTest):
                             self.fail("concurrent HTTP recovery")
                     raise RuntimeError("precheck")
             self.assertEqual(set(owners), {"primary"})
+            foreign_record = True
+            with self.assertRaisesRegex(RuntimeError, "不会删除"):
+                with coordinator.recovery_lease(token):
+                    pass
+            self.assertEqual(set(owners), {"primary"})
+            foreign_record = False
             with coordinator.recovery_lease(token):
                 pass
         self.assertEqual(owners, {})

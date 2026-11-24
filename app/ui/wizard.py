@@ -33,6 +33,7 @@ from app.ui.pages.settings import (
     _ConnectionInput,
     _ConnectionResult,
     _OperationThread,
+    _ServerCertificateInput,
     _card,
     _feedback,
     _field,
@@ -144,7 +145,7 @@ class WizardDialog(QDialog, _AsyncOperations):
         body.setSpacing(16)
         connection, connection_layout = _card("01  连接手机 WebDAV", "填写手机端 WebDAV 显示的地址。可先测试，测试不会保存账号或更改挂载连接。")
         self.url_edit = QLineEdit(config.url)
-        self.url_edit.setPlaceholderText("http://手机地址:端口/路径")
+        self.url_edit.setPlaceholderText("https://手机地址:端口/路径")
         self.user_edit = QLineEdit(config.username)
         self.pass_edit = QLineEdit()
         self.pass_edit.setEchoMode(QLineEdit.EchoMode.Password)
@@ -155,6 +156,8 @@ class WizardDialog(QDialog, _AsyncOperations):
         credentials.addLayout(_field("用户名", self.user_edit), 1)
         credentials.addLayout(_field("密码", self.pass_edit), 1)
         connection_layout.addLayout(credentials)
+        self.certificate_input = _ServerCertificateInput(self.url_edit, config)
+        connection_layout.addWidget(self.certificate_input)
         test_row = QHBoxLayout()
         self.test_button = button("测试连接", glyph="link")
         self.test_label = label("尚未测试当前输入", "muted")
@@ -281,7 +284,7 @@ class WizardDialog(QDialog, _AsyncOperations):
         root.addLayout(actions)
 
         self._editors = (
-            self.url_edit, self.user_edit, self.pass_edit, self.drive_combo,
+            self.url_edit, self.user_edit, self.pass_edit, self.certificate_input, self.drive_combo,
             self.mount_check, self.auto_mount_check, self.autostart_check,
             self.direction_combo, self.folder_list, self.interval_spin, self.retention_spin,
             self.preset_combo, self.enable_tasks_check, self.auto_sync_check,
@@ -299,6 +302,7 @@ class WizardDialog(QDialog, _AsyncOperations):
         self.folder_list.currentRowChanged.connect(self._refresh_controls)
         for edit in (self.url_edit, self.user_edit, self.pass_edit):
             edit.textChanged.connect(self._connection_edited)
+        self.certificate_input.changed.connect(self._connection_edited)
         for signal in (self.interval_spin.valueChanged, self.retention_spin.valueChanged, self.preset_combo.currentIndexChanged):
             signal.connect(self._refresh_folders)
         self._refresh_folders()
@@ -322,8 +326,8 @@ class WizardDialog(QDialog, _AsyncOperations):
 
     def _connection_input(self) -> _ConnectionInput:
         return _ConnectionInput(
-            self.url_edit.text().strip().rstrip("/"),
-            self.user_edit.text().strip(), self.pass_edit.text(),
+            self.certificate_input.endpoint, self.user_edit.text().strip(), self.pass_edit.text(),
+            self.certificate_input.certificate,
         )
 
     def _connection_edited(self) -> None:

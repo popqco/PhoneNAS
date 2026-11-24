@@ -18,11 +18,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping
+from xml.etree import ElementTree as ET
 
 from app import constants as C
 from app.core.filenames import LEGACY, LITERAL, portable_name_key, require_legacy_paths, require_legacy_rules
 from app.core.history import validate_history_inventory
 from app.core.tasks import MirrorTask, dataset_id_for_remote, normalize_remote_path
+from app.core.tls import tls_context, webdav_url
 from app.core.winpath import filesystem_path
 
 
@@ -479,15 +481,88 @@ class DatasetCoordinator:
                 else _WebDAVDatasetLease(self.rclone, self.task))
 
     @contextmanager
-    def lease(self):
-        with self._new_lease() as lease:
-            yield lease
+    def lease(self, *, token: str | None = None):
+        lease = self._new_lease()
+        if token is not None:
+            lease.token = _uuid(token)
+        with lease as acquired:
+            yield acquired
+
+    @contextmanager
+    def recorded_lease(self, context, journal):
+        """Clear a control intent only after an acknowledged dataset release."""
+        lease = None
+        try:
+            with context as lease:
+                yield lease
+        finally:
+            if lease is not None and lease.released:
+                journal.clear_control(lease.token)
+
+    @contextmanager
+    def control_lease(self, journal, operation: str, *, registering: bool = False):
+        """Reserve recovery proof before a control-only operation takes a lock."""
+        if journal.load() is not None:
+            raise RuntimeError("本机有未完成的操作；请先核对续作。")
+        token = uuid.uuid4().hex
+        journal.save_control(operation, token, registration=registering)
+        acquired = False
+        try:
+            with self.recorded_lease(self.lease(token=token), journal) as lease:
+                acquired = True
+                yield lease
+        except DatasetLeaseRefused:
+            if not acquired:
+                journal.clear_control(token)
+            raise
 
     @contextmanager
     def registration_lease(self, dataset_lease):
-        """Serialize first registrations and purges across dataset IDs."""
-        with dataset_lease.for_registration():
-            yield
+        """Serialize changes to the registry; recovery uses the dataset's recorded token."""
+        registration = dataset_lease.for_registration()
+        registration.token = dataset_lease.token
+        try:
+            with registration:
+                yield
+        except DatasetLeaseRefused:
+            raise
+        except BaseException:
+            if not registration.released:
+                dataset_lease.retain()
+            raise
+
+    def release_interrupted_registration(self, dataset_lease, *, required: bool = False) -> None:
+        """Discard only an exact registration lock under its dataset recovery lease."""
+        registration = dataset_lease.for_registration()
+        registration.token = dataset_lease.token
+        expected = _owner(self.task, registration.token)
+        owner = registration.read_owner()
+        if owner == expected:
+            registration.release_owned()
+        elif (required or (owner is None and registration.present())
+              or (isinstance(owner, dict) and all(owner.get(key) == expected[key]
+                  for key in ("dataset_id", "writer_identity")))):
+            raise RuntimeError("目录登记锁的原所有权无法确认；请保留锁和未完成记录。")
+
+    def owned_locks(self, token: str, *, registration: bool) -> tuple[bool, bool]:
+        """Read-only proof of which locks still belong to a recorded operation."""
+        expected = _owner(self.task, _uuid(token))
+        dataset = self._new_lease()
+
+        def owned(lease) -> bool:
+            owner = lease.read_owner()
+            if owner is None:
+                if lease.present():
+                    raise RuntimeError("锁目录仍在，但缺少可核验的所有者记录。")
+                return False
+            if (type(owner) is not dict or set(owner) != set(expected) or type(owner["version"]) is not int
+                    or owner["version"] != 1
+                    or any(not isinstance(owner[key], str) or not re.fullmatch(r"[0-9a-f]{32}", owner[key])
+                           for key in ("dataset_id", "writer_identity", "token"))):
+                raise RuntimeError("锁的所有者记录无法核验。")
+            return owner == expected
+
+        return owned(dataset), owned(dataset.for_registration()) if registration else False
 
     @contextmanager
     def recovery_lease(self, expected_token: str):
@@ -621,20 +696,24 @@ def find_published_dataset(rclone, mirror: str, *, cancelled=None) -> dict | Non
     return match
 
 
-def verify_remote_scope(rclone, task: MirrorTask, *, require_ready=False, cancelled=None) -> None:
-    """Reject overlaps with any other visible registered mirror or archive."""
+def verify_remote_scope(rclone, task: MirrorTask, *, registering=False, require_ready=False, cancelled=None) -> None:
+    """Reject overlaps with other datasets and verify a new control directory fits."""
     registry = _DatasetRegistry(rclone, cancelled)
     expected = _task_scope(task)
     paths = tuple(_registered_root(expected[key]) for key in ("remote_path", "versions_path"))
     ids = registry.ids()
+    # Empty control directories count too: a previous write may have created
+    # one without reaching state.json. That dataset can still reuse its slot.
+    if registering and task.dataset_id not in ids and len(ids) >= _DATASET_SCAN_LIMIT:
+        raise RuntimeError(f"手机数据集登记已满（最多 {_DATASET_SCAN_LIMIT} 项）；不能新增数据集。")
     if require_ready:
         state = registry.state(task.dataset_id)
         if state is not None and state["phase"] != "ready":
-            raise RuntimeError("数据集有未完成发布；不能永久删除手机历史。")
+            raise RuntimeError("数据集有未完成发布；不能恢复或永久删除手机历史。")
         if state is None or not state.get("content_digest"):
-            raise RuntimeError("手机历史目录没有已发布的可核实归属，拒绝永久删除。")
+            raise RuntimeError("手机历史目录没有已发布的可核实归属，不能恢复或永久删除。")
         if any(state[key] != value for key, value in expected.items()):
-            raise RuntimeError("手机历史目录的发布记录与任务不匹配，拒绝永久删除。")
+            raise RuntimeError("手机历史目录的发布记录与任务不匹配，不能恢复或永久删除。")
     for dataset_id in sorted(ids - {task.dataset_id}):
         record = registry.state(dataset_id)
         if record is None:
@@ -651,6 +730,14 @@ def _owner(task: MirrorTask, token: str) -> dict:
             "writer_identity": task.sync_identity, "token": token}
 
 
+class DatasetLeaseRefused(RuntimeError):
+    """The attempt was refused before a new lock could be acquired."""
+
+
+class DatasetLeaseBusy(DatasetLeaseRefused):
+    """The exclusive create was refused because another lock exists."""
+
+
 class LocalDatasetLease:
     """Offline alias equivalent of an exclusive MKCOL; never steals stale locks."""
 
@@ -661,6 +748,7 @@ class LocalDatasetLease:
         self.token = uuid.uuid4().hex
         self._held = False
         self._retained = False
+        self.released = False
 
     def for_registration(self):
         lease = LocalDatasetLease(self.path.parents[2], self.task)
@@ -676,7 +764,7 @@ class LocalDatasetLease:
         try:
             os.mkdir(self.path, mode=0o700)
         except FileExistsError as exc:
-            raise RuntimeError("数据集已锁定；不会自动接管旧锁") from exc
+            raise DatasetLeaseBusy("数据集已锁定；不会自动接管旧锁") from exc
         self._held = True
         try:
             _atomic_json(self.path / "owner.json", _owner(self.task, self.token))
@@ -686,19 +774,38 @@ class LocalDatasetLease:
             raise
         return self
 
+    @property
+    def retained(self) -> bool:
+        return self._retained
+
     def retain(self) -> None:
         if not self._held:
             raise RuntimeError("没有持有数据集锁")
         self._retained = True
 
+    def present(self) -> bool:
+        _no_links(self.path)
+        try:
+            self.path.lstat()
+        except FileNotFoundError:
+            return False
+        return True
+
+    def read_owner(self) -> dict | None:
+        try:
+            return _json(_read_file(self.path / "owner.json", _CONTROL_LIMIT), _CONTROL_LIMIT)
+        except FileNotFoundError:
+            return None
+
     def _verify_owner(self) -> None:
-        owner = _json(_read_file(self.path / "owner.json", _CONTROL_LIMIT), _CONTROL_LIMIT)
-        if owner != _owner(self.task, self.token):
+        if self.read_owner() != _owner(self.task, self.token):
             raise RuntimeError("锁所有者已改变")
 
-    def _release(self) -> None:
+    def release_owned(self) -> None:
         self._verify_owner()
         _no_links(self.path)
+        if {entry.name for entry in self.path.iterdir()} != {"owner.json"}:
+            raise RuntimeError("锁目录含有其他记录，不会删除。")
         (self.path / "owner.json").unlink()
         self.path.rmdir()
 
@@ -712,6 +819,7 @@ class LocalDatasetLease:
         recovery = LocalDatasetLease.__new__(LocalDatasetLease)
         recovery.task, recovery.path = self.task, self.path / "recovery"
         recovery.token, recovery._held, recovery._retained = uuid.uuid4().hex, False, False
+        recovery.released = False
         with recovery:
             self._verify_owner()  # Check again after acquiring the exclusive child.
             self._held = True
@@ -719,6 +827,10 @@ class LocalDatasetLease:
                 yield self
                 if not self._retained:
                     self._verify_owner()
+                    recovery._verify_owner()
+                    if ({entry.name for entry in self.path.iterdir()} != {"owner.json", "recovery"}
+                            or {entry.name for entry in recovery.path.iterdir()} != {"owner.json"}):
+                        raise RuntimeError("锁目录含有其他记录，不会删除。")
                     (self.path / "owner.json").unlink()  # Invalidate proof before releasing child.
             except BaseException:
                 self._retained = True
@@ -728,11 +840,13 @@ class LocalDatasetLease:
         if not self._retained:
             _no_links(self.path)
             self.path.rmdir()
+            self.released = True
 
     def __exit__(self, exc_type, exc, traceback):
         if self._held and not self._retained:
             try:
-                self._release()
+                self.release_owned()
+                self.released = True
             except (OSError, ValueError, RuntimeError) as cleanup:
                 if exc is not None:
                     exc.add_note(f"数据集锁未释放：{cleanup}")
@@ -747,19 +861,6 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def _unverified_ssl_context() -> ssl.SSLContext:
-    """Accept the phone's self-signed certificate on its private endpoint.
-
-    The control requests already refuse proxies and redirects, and the URL is
-    restricted to the configured phone address, so host verification cannot
-    establish a stronger identity than the user's own endpoint.
-    """
-    context = ssl.create_default_context()
-    context.check_hostname = False
-    context.verify_mode = ssl.CERT_NONE
-    return context
-
-
 class _WebDAVDatasetLease:
     """Atomic MKCOL, not rclone mkdir. HTTP cleanup ignores rclone cancellation.
 
@@ -770,13 +871,11 @@ class _WebDAVDatasetLease:
     def __init__(self, rclone, task: MirrorTask):
         self.rclone, self.task = rclone, task
         self.token = uuid.uuid4().hex
-        self._held = self._retained = False
+        self._held = self._retained = self.released = False
         config = rclone.config
-        base = urllib.parse.urlsplit(config.url)
-        if (base.scheme not in ("http", "https") or not base.netloc or base.username is not None
-                or base.password is not None or base.query or base.fragment
-                or any(ord(char) < 32 for char in config.url)):
-            raise ValueError("数据集锁需要不含凭据、查询串或片段的 HTTP(S) WebDAV 地址")
+        if getattr(config, "connection_needs_confirmation", False):
+            raise ValueError("请先在设置中核对并保存 WebDAV 地址和账号")
+        base = webdav_url(config.url)
         control = ".phonenas/locks/" + task.dataset_id
         self.url = config.url.rstrip("/") + "/" + urllib.parse.quote(control, safe="/") + "/"
         credentials = f"{config.username}:{config.password}".encode("utf-8")
@@ -784,16 +883,18 @@ class _WebDAVDatasetLease:
         # Ignore proxy environment and refuse every redirect, including same-host.
         handlers = [urllib.request.ProxyHandler({}), _NoRedirect()]
         if base.scheme == "https":
-            handlers.append(urllib.request.HTTPSHandler(context=_unverified_ssl_context()))
+            lookup = getattr(config, "trusted_certificate_for", None)
+            pem = lookup(config.url) if lookup else ""
+            handlers.append(urllib.request.HTTPSHandler(context=tls_context(pem)))
         self.opener = urllib.request.build_opener(*handlers)
 
     def for_registration(self):
-        lease = _WebDAVDatasetLease(self.rclone, self.task)
+        lease = _WebDAVRegistrationLease(self.rclone, self.task)
         lease.url = lease.url.rstrip("/").rsplit("/", 1)[0] + "/directory-registration/"
         return lease
 
-    def _request(self, method: str, url: str, data: bytes | None = None) -> tuple[int, bytes]:
-        headers = {"Authorization": self.authorization}
+    def _request(self, method: str, url: str, data: bytes | None = None, *, extra_headers=None) -> tuple[int, bytes]:
+        headers = {"Authorization": self.authorization, **(extra_headers or {})}
         if data is not None:
             headers["Content-Type"] = "application/json; charset=utf-8"
         request = urllib.request.Request(url, data=data, headers=headers, method=method)
@@ -807,7 +908,9 @@ class _WebDAVDatasetLease:
             code = exc.code
             exc.close()
             return code, b""
-        except (OSError, urllib.error.URLError) as exc:
+        except OSError as exc:
+            if isinstance(getattr(exc, "reason", exc), ssl.SSLCertVerificationError):
+                raise RuntimeError("WebDAV 证书校验失败；请核对地址与已信任的服务器证书") from exc
             raise RuntimeError("WebDAV 数据集锁请求未确认完成") from exc
 
     def __enter__(self):
@@ -815,10 +918,12 @@ class _WebDAVDatasetLease:
             raise RuntimeError("数据集锁不可重入")
         result = self.rclone.run(["mkdir", f"{C.DEFAULT_REMOTE}:.phonenas/locks"], timeout=60)
         if not result.ok:
-            raise RuntimeError(f"无法建立锁父目录：{result.err or result.out or result.code}")
+            raise DatasetLeaseRefused(f"无法建立锁父目录：{result.err or result.out or result.code}")
         status, _ = self._request("MKCOL", self.url)
         if status == 405:
-            raise RuntimeError("数据集已锁定；不会自动接管旧锁")
+            raise DatasetLeaseBusy("数据集已锁定；不会自动接管旧锁")
+        if status in (401, 403, 409, 501):
+            raise DatasetLeaseRefused(f"WebDAV 已拒绝独占数据集锁（HTTP {status}）")
         if status != 201:
             raise RuntimeError(f"WebDAV 不支持独占数据集锁或请求失败（HTTP {status}）")
         self._held = True
@@ -832,21 +937,64 @@ class _WebDAVDatasetLease:
             raise  # No token proof: fail closed and leave the acquired directory.
         return self
 
+    @property
+    def retained(self) -> bool:
+        return self._retained
+
     def retain(self) -> None:
         if not self._held:
             raise RuntimeError("没有持有数据集锁")
         self._retained = True
 
-    def _verify_owner(self) -> None:
+    def present(self) -> bool:
+        status, _ = self._request("PROPFIND", self.url, extra_headers={"Depth": "0"})
+        if status not in (207, 404):
+            raise RuntimeError(f"无法核对锁是否仍在（HTTP {status}）")
+        return status == 207
+
+    def read_owner(self) -> dict | None:
         status, raw = self._request("GET", self.url + "owner.json")
-        if status != 200 or _json(raw.decode("utf-8"), _CONTROL_LIMIT) != _owner(self.task, self.token):
+        if status == 404:
+            return None
+        if status != 200:
+            raise RuntimeError(f"无法核对锁所有权（HTTP {status}）")
+        return _json(raw.decode("utf-8"), _CONTROL_LIMIT)
+
+    def _verify_owner(self) -> None:
+        if self.read_owner() != _owner(self.task, self.token):
             raise RuntimeError("数据集锁所有者无法确认")
 
-    def _release(self) -> None:
+    def release_owned(self) -> None:
         self._verify_owner()
+        self._require_children("owner.json")
+        self._delete_lock()
+
+    def _delete_lock(self) -> None:
         status, _ = self._request("DELETE", self.url)
         if status not in (200, 204):
             raise RuntimeError(f"锁删除未确认（HTTP {status}）")
+
+    def _require_children(self, *names: str) -> None:
+        status, raw = self._request("PROPFIND", self.url, extra_headers={"Depth": "1"})
+        location = urllib.parse.urlsplit(self.url)
+        base = urllib.parse.unquote(location.path, errors="strict").rstrip("/")
+        try:
+            if status != 207:
+                raise ValueError(f"HTTP {status}")
+            listing = ET.fromstring(raw)
+            if listing.tag != "{DAV:}multistatus":
+                raise ValueError("无效的目录清单")
+            paths = []
+            for response in listing.findall("{DAV:}response"):
+                link = urllib.parse.urlsplit(response.findtext("{DAV:}href", ""))
+                if (link.query or link.fragment or link.scheme not in ("", location.scheme)
+                        or link.netloc.lower() not in ("", location.netloc.lower())):
+                    raise ValueError("无效的锁记录地址")
+                paths.append(urllib.parse.unquote(link.path, errors="strict").removesuffix("/"))
+            if sorted(paths) != sorted([base, *(f"{base}/{name}" for name in names)]):
+                raise ValueError("锁目录含有其他记录")
+        except (ET.ParseError, ValueError) as exc:
+            raise RuntimeError("无法证明锁目录只有已核对的记录；不会删除。") from exc
 
     @contextmanager
     def recover(self, expected_token: str):
@@ -874,7 +1022,11 @@ class _WebDAVDatasetLease:
                 self._held = False
             if not self._retained:
                 recovery._verify_owner()
-                self._release()  # DELETE primary atomically removes its owned recovery child.
+                recovery._require_children("owner.json")
+                self._verify_owner()
+                self._require_children("owner.json", "recovery")
+                self._delete_lock()  # This also removes the verified recovery child.
+                self.released = True
                 recovery._held = False
         finally:
             if recovery._held:
@@ -883,7 +1035,8 @@ class _WebDAVDatasetLease:
     def __exit__(self, exc_type, exc, traceback):
         if self._held and not self._retained:
             try:
-                self._release()
+                self.release_owned()
+                self.released = True
             except (OSError, ValueError, RuntimeError) as cleanup:
                 if exc is not None:
                     exc.add_note(f"数据集锁未释放：{cleanup}")
@@ -891,3 +1044,42 @@ class _WebDAVDatasetLease:
                     raise RuntimeError("数据集锁未能释放，已保留供人工核查") from cleanup
         self._held = False
         return False
+
+
+class _WebDAVRegistrationLease(_WebDAVDatasetLease):
+    """Install a fully owned global lock with an exclusive WebDAV MOVE."""
+
+    def __init__(self, rclone, task: MirrorTask, *, staging: bool = False):
+        super().__init__(rclone, task)
+        self._staging = staging
+
+    def __enter__(self):
+        if self._staging:
+            return super().__enter__()
+        if self._held:
+            raise RuntimeError("目录登记锁不可重入")
+        # A crash before MOVE can leave only a private staging directory, not
+        # an empty canonical lock that would keep every publisher out.
+        stage = _WebDAVRegistrationLease(self.rclone, self.task, staging=True)
+        stage.token = self.token
+        stage.url = self.url.rstrip("/") + "-stage-" + uuid.uuid4().hex + "/"
+        with stage:
+            status, _ = self._request("MOVE", stage.url, extra_headers={
+                "Destination": self.url, "Overwrite": "F",
+            })
+            if status == 201:
+                stage._held = False
+            elif status not in (405, 412, 501):
+                raise RuntimeError(f"WebDAV 未确认独占移动目录登记锁（HTTP {status}）")
+        # Classify definitive refusals only after the private staging directory
+        # was cleaned successfully. An uncertain outcome retains the journal.
+        if status == 412:
+            raise DatasetLeaseBusy("目录登记锁已占用；不会自动接管。")
+        if status in (405, 501):
+            owner = self.read_owner()
+            if owner == _owner(self.task, self.token) or (owner is None and self.present()):
+                raise RuntimeError(f"目录登记锁状态仍待核对（HTTP {status}）")
+            raise DatasetLeaseRefused(f"WebDAV 不支持独占移动目录登记锁（HTTP {status}）")
+        self._verify_owner()
+        self._held = True
+        return self

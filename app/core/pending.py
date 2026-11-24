@@ -6,6 +6,15 @@ from app.core.filenames import LEGACY, LITERAL
 from app.core.relay import BaselineStore, ContentSnapshot, _atomic_json, _json, _no_links, _read_file
 
 
+CONTROL_OPERATIONS = {
+    "finalize": "已校验同步的收尾",
+    "initialize_baseline": "共同基线初始化",
+    "history_delete": "手机历史清理",
+    "history_restore": "手机历史恢复",
+    "rejected": "写入前停止的操作",
+}
+
+
 class PendingOperation:
     """A content-bound intent, never an automatic authorization to resume writes."""
 
@@ -24,6 +33,16 @@ class PendingOperation:
             if (type(value) is not dict or type(value.get("version")) is not int
                     or value["version"] not in (LEGACY, LITERAL) or value.get("binding") != self.binding):
                 raise ValueError("操作身份已变化")
+            if not isinstance(value["lock_token"], str) or not re.fullmatch(r"[0-9a-f]{32}", value["lock_token"]):
+                raise ValueError("无效的锁凭据")
+            if value["operation"] in CONTROL_OPERATIONS:
+                if (value["version"] != 1
+                        or set(value) != {"version", "binding", "operation", "lock_token", "registration"}
+                        or type(value["registration"]) is not bool
+                        or (value["registration"] and value["operation"] not in (
+                            "initialize_baseline", "history_delete", "finalize"))):
+                    raise ValueError("无效的锁恢复记录")
+                return value
             if value["operation"] not in ("publish", "receive", "return", "adopt"):
                 raise ValueError("无效操作")
             for name in ("generation", "lock_token"):
@@ -65,6 +84,19 @@ class PendingOperation:
             "generation": generation, "stamp": stamp, "lock_token": lock_token,
             "prior_metadata": prior_metadata,
         })
+
+    def save_control(self, operation: str, lock_token: str, *, registration: bool = False) -> None:
+        if operation not in CONTROL_OPERATIONS or not re.fullmatch(r"[0-9a-f]{32}", lock_token):
+            raise ValueError("无效的锁恢复记录")
+        # Older clients must reject this intent, not mistake it for authorization
+        # to replay a transfer. Filename protocol only applies to payload intents.
+        _atomic_json(self.path, {"version": 1, "binding": self.binding, "operation": operation,
+                                 "lock_token": lock_token, "registration": registration})
+
+    def clear_control(self, token: str) -> None:
+        value = self.load()
+        if value is not None and value["operation"] in CONTROL_OPERATIONS and value["lock_token"] == token:
+            self.clear()
 
     def clear(self) -> None:
         _no_links(self.path)

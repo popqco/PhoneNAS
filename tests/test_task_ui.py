@@ -413,6 +413,17 @@ class TaskUiTests(unittest.TestCase):
         self.assertEqual(dialog.task.excludes, rules)
         self.assertEqual(dialog.task.sync_identity, task.sync_identity)
 
+    def test_retention_help_explains_which_history_is_automatically_cleaned(self):
+        from PySide6.QtWidgets import QLabel
+
+        from app.ui.task_dialog import TaskDialog
+
+        dialog = self.keep(TaskDialog(self.config, operational=False))
+        schedule = dialog.tabs.widget(1)
+        text = "\n".join(item.text() for item in schedule.findChildren(QLabel))
+        self.assertIn("原名协议下，仅在发布成功后自动清理本任务手机历史中的过期批次", text)
+        self.assertIn("旧协议的手机历史和本地历史均不自动清理", text)
+
     def test_schedule_auto_sync_is_independent_of_enabled_and_preserves_binding_authority(self):
         from app.core.tasks import new_task
         from app.ui.task_dialog import TaskDialog
@@ -602,6 +613,58 @@ class TaskUiTests(unittest.TestCase):
         blocked.accept()
         self.assertFalse(blocked.execute_button.isEnabled())
         self.assertEqual(blocked.result(), QDialog.DialogCode.Rejected)
+
+    def test_recovery_release_preview_explains_controls_without_file_changes(self):
+        from PySide6.QtWidgets import QLabel, QTableWidget
+
+        from app.core.sync import SyncReport
+        from app.core.tasks import new_task
+        from app.ui.preview_dialog import PreviewDialog
+
+        task = new_task(str(self.source), direction="download")
+        for reason in (
+            "仅解除目录登记锁；保留现有数据集操作日志，供稍后继续核对。",
+            "上次操作已完成；解除本次操作持有的锁以完成收尾。",
+        ):
+            with self.subTest(reason=reason):
+                report = SyncReport(operation="release", digest="verified-locks", requires_confirmation=True,
+                                    reason=reason, added=1, changes=(("+", "old-work.txt"),))
+                dialog = self.keep(PreviewDialog(task, report, reason, operation="recover"))
+                dialog.show()
+                words = "\n".join(item.text() for item in dialog.findChildren(QLabel) if item.isVisible())
+                self.assertIn("解除保护锁", dialog.windowTitle())
+                self.assertIn(task.remote_path, words)
+                self.assertIn("工作文件与历史文件保持原样", words)
+                self.assertEqual(words.count(reason), 1)
+                for payload_text in ("来源 ·", "目标 ·", "新增 1", "自动清理", "old-work.txt"):
+                    self.assertNotIn(payload_text, words)
+                self.assertFalse(any(table.isVisible() for table in dialog.findChildren(QTableWidget)))
+                self.assertTrue(dialog.close_button.isDefault())
+                self.assertEqual(dialog.execute_button.text(), "确认并解除保护锁")
+                self.assertTrue(dialog.execute_button.isEnabled())
+                dialog.execute_button.click()
+                self.assertEqual(dialog.result(), QDialog.DialogCode.Accepted)
+
+    def test_release_confirmation_stays_inactive_when_blocked_disabled_or_unverified(self):
+        from app.core.sync import SyncReport
+        from app.core.tasks import new_task
+        from app.ui.preview_dialog import PreviewDialog
+
+        task = new_task(str(self.source))
+        report = SyncReport(operation="release", digest="verified-locks", requires_confirmation=True)
+        for target, preview in (
+            (task, replace(report, blocked=True, reason="锁归属未核实")),
+            (replace(task, enabled=False), report),
+            (task, replace(report, digest="")),
+            (task, replace(report, requires_confirmation=False)),
+        ):
+            with self.subTest(task_enabled=target.enabled, preview=preview):
+                dialog = self.keep(PreviewDialog(target, preview, operation="recover"))
+                self.assertFalse(dialog.execute_button.isEnabled())
+                dialog.execute_button.click()
+                dialog.accept()
+                dialog.done(QDialog.DialogCode.Accepted)
+                self.assertEqual(dialog.result(), QDialog.DialogCode.Rejected)
 
     def test_wizard_is_inert_on_open_and_receive_choice_saves_connection_without_empty_upload_tasks(self):
         from app.ui.wizard import WizardDialog

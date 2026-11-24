@@ -4,14 +4,16 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+$vendorHashes = & (Join-Path $PSScriptRoot 'read-vendor-checksums.ps1')
+
 $root = Split-Path $PSScriptRoot -Parent
 $vendor = Join-Path $root 'vendor'
 New-Item -ItemType Directory -Force -Path $vendor | Out-Null
 
 $rcloneVersion = '1.76.0'
-$rcloneSha256 = 'acd80683e23151e93bbe0d6ffa74d26e542ec510332f630beecb9944f8d1a623'
+$rcloneSha256 = $vendorHashes.'rclone.exe'
 $winfspVersion = '2.1.25156'
-$winfspSha256 = '073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a'
+$winfspSha256 = $vendorHashes.'winfsp.msi'
 
 Write-Host "== rclone v$rcloneVersion =="
 $rcloneZip = Join-Path $env:TEMP "rclone-v$rcloneVersion-windows-amd64.zip"

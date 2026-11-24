@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import json
 import tempfile
 import unittest
 from dataclasses import replace
@@ -481,6 +482,106 @@ class DesktopRegressionTests(unittest.TestCase):
         self.assertEqual((self.config.tasks[0].auto_sync, self.config.tasks[0].interval_minutes),
                          (self.task.auto_sync, self.task.interval_minutes))
 
+    def test_legacy_connection_waits_for_saved_confirmation_before_background_or_remote_actions(self):
+        self.config.set("mount.auto_mount", True)
+        self.config.set("app.schedule_approval", "1.2.4-filenames")
+        self.config.upsert_task(replace(self.task, auto_sync=False))
+        self.config.save()
+        original = json.loads(self.config.path.read_text(encoding="utf-8"))
+        del original["nas"]["username"]
+        self.config.path.write_text(json.dumps(original), encoding="utf-8")
+        self.config = Config(self.config.path)
+        self.assertTrue(self.config.connection_needs_confirmation)
+
+        callbacks = {}
+        with patch.object(QTimer, "singleShot", side_effect=lambda ms, _context, slot: callbacks.__setitem__(ms, slot)):
+            window = self.simulated_window(operational=True, with_tray=True)
+        with (patch.object(window.mount, "start") as mount,
+              patch("app.ui.main_window.winfsp.is_installed", return_value=True),
+              patch("app.ui.pages.versions._HistoryWorker", side_effect=RuntimeError("isolated test")) as history):
+            for delay in (400, 2500):
+                if delay in callbacks:
+                    callbacks[delay]()
+            window.status_page.mount_toggle_requested.emit()
+            window.run_sync(self.task.id)
+            window.mirror_page.cards[self.task.id].recover_action.trigger()
+            window.scheduler.request(self.task.id, manual=False)
+            self.app.processEvents()
+            mount.assert_not_called()
+            self.assertIsNone(window.sync_worker)
+            self.assertFalse(window.scheduler._started)
+            self.assertFalse(window.status_page.mount_button.isEnabled())
+            self.assertFalse(window.status_page.sync_button.isEnabled())
+            self.assertFalse(window.mirror_page.pause_button.isEnabled())
+            self.assertTrue(window.tray.contextMenu().actions()[0].isEnabled())
+            self.assertFalse(window.tray.contextMenu().actions()[2].isEnabled())
+
+            window.sidebar.setCurrentRow(2)
+            page = window.versions_page
+            page.refresh()
+            self.assertFalse(page.refresh_button.isEnabled())
+            self.assertIn("确认", page.busy_hint.text())
+            history.assert_not_called()
+            page.location_combo.setCurrentIndex(page.location_combo.findData("local"))
+            self.assertTrue(page.refresh_button.isEnabled())
+            window.sidebar.setCurrentRow(4)
+            self.assertTrue(window.settings_page.save_button.isEnabled())
+            self.assertTrue(window.settings_page.import_button.isEnabled())
+
+            window.settings_page.tray_check.setChecked(False)
+            with patch("app.ui.pages.settings.set_autostart", return_value=(True, "test only")):
+                for answer in (QMessageBox.StandardButton.No, QMessageBox.StandardButton.Yes):
+                    with patch.object(QMessageBox, "exec", return_value=answer.value):
+                        window.settings_page.save_button.click()
+                    for _ in range(200):
+                        if not window.settings_page.busy:
+                            break
+                        QTest.qWait(10)
+                    self.assertFalse(window.settings_page.busy)
+                    saved = Config(self.config.path)
+                    self.assertFalse(saved.get("app.minimize_to_tray"))
+                    self.assertEqual(saved.connection_needs_confirmation, answer == QMessageBox.StandardButton.No)
+                    if answer == QMessageBox.StandardButton.No:
+                        mount.assert_not_called()
+                        self.assertFalse(window.scheduler._started)
+                        self.assertFalse(window.status_page.sync_button.isEnabled())
+            self.assertFalse(self.config.connection_needs_confirmation)
+            mount.assert_called_once()
+            self.assertTrue(window.scheduler._started)
+            self.assertTrue(window.status_page.sync_button.isEnabled())
+            self.assertTrue(window.tray.contextMenu().actions()[2].isEnabled())
+            window.sidebar.setCurrentRow(2)
+            history.assert_called_once()
+            self.assertEqual(history.call_args.kwargs["location"], "remote")
+
+    def test_importing_unconfirmed_connection_disarms_mount_retry_and_drops_queued_sync(self):
+        self.config.set("mount.auto_mount", False)
+        self.config.set("app.schedule_approval", "1.2.4-filenames")
+        self.config.upsert_task(replace(self.task, last_sync_at="2000-01-01 00:00:00"))
+        self.config.save()
+        profile = json.loads(self.config.path.read_text(encoding="utf-8"))
+        del profile["nas"]["username"]
+        imported = self.base / "old-connection.json"
+        imported.write_text(json.dumps(profile), encoding="utf-8")
+        callbacks = {}
+        with patch.object(QTimer, "singleShot", side_effect=lambda ms, _context, slot: callbacks.__setitem__(ms, slot)):
+            window = self.simulated_window(operational=True)
+        callbacks[2500]()
+        self.assertEqual(window.scheduler.queue.queued_ids, (self.task.id,))
+        window.mount._state = "retrying"
+        window.mount._retry_timer.start(5000)
+
+        self.config.import_from(imported)
+        window.settings_page.saved.emit()
+        self.app.processEvents()
+
+        self.assertTrue(self.config.connection_needs_confirmation)
+        self.assertEqual(window.mount.state, "stopped")
+        self.assertFalse(window.mount._retry_timer.isActive())
+        self.assertFalse(window.scheduler._started)
+        self.assertEqual(window.scheduler.queue.queued_ids, ())
+        self.assertIsNone(window.sync_worker)
+
     def test_delayed_existing_profile_callbacks_do_not_restart_after_quit_begins(self):
         callbacks = {}
         with patch.object(QTimer, "singleShot", side_effect=lambda ms, _context, slot: callbacks.__setitem__(ms, slot)):
@@ -697,6 +798,64 @@ class DesktopRegressionTests(unittest.TestCase):
         card = window.mirror_page.cards[self.task.id]
         self.assertFalse(card.cancel_button.isHidden())
         self.assertNotEqual(card.badge.text(), "等待执行")
+
+    def test_recovery_release_requires_explicit_confirmation_and_preserves_last_sync(self):
+        window = self.simulated_window()
+        self.config.save()
+        before = self.config.path.read_bytes()
+        report = SyncReport(operation="release", digest="approved-locks", requires_confirmation=True,
+                            reason="仅解除目录登记锁；保留现有数据集操作日志。")
+        confirmations = []
+
+        def choose(button):
+            dialog = self.app.activeModalWidget()
+            confirmations.append((window.sync_worker, window.statusBar().currentMessage()))
+            control = getattr(dialog, button, None)
+            if control is not None and control.isEnabled():
+                control.click()
+            elif isinstance(dialog, QDialog):
+                dialog.reject()
+
+        for button in ("close_button", "execute_button"):
+            window.mirror_page.cards[self.task.id].recover_action.trigger()
+            preview = window.sync_worker
+            self.assertEqual((preview.operation, preview.preview_only, preview.approved_digest), ("recover", True, ""))
+            QTimer.singleShot(0, window, lambda name=button: choose(name))
+            preview.complete_preview(report, report.reason)
+            if button == "close_button":
+                self.assertIsNone(window.sync_worker)
+            self.assertIsNone(confirmations[-1][0])
+            self.assertIn("保护锁", confirmations[-1][1])
+            self.assertNotIn("新增", confirmations[-1][1])
+
+        apply = window.sync_worker
+        self.assertIsInstance(apply, ProgressWorker)
+        self.assertEqual((apply.operation, apply.preview_only, apply.approved_digest), ("recover", False, report.digest))
+        with self.assertLogs("PhoneNAS", level="INFO") as log:
+            apply.finished_ok.emit(self.task.id, report, "")
+            apply.finish()
+        self.assertEqual(self.config.get_task(self.task.id), self.task)
+        self.assertEqual(self.config.path.read_bytes(), before)
+        self.assertIn("保护锁处理完成", window.statusBar().currentMessage())
+        self.assertIn("保护锁处理完成", window.mirror_page.cards[self.task.id].message_label.fullText())
+        self.assertIn(report.reason, "\n".join(log.output))
+        self.assertNotIn("同步完成", "\n".join(log.output))
+        self.assertNotIn("新增", window.statusBar().currentMessage())
+
+    def test_recovery_does_not_launch_if_saving_the_proven_connection_fails(self):
+        window = self.simulated_window()
+        report = SyncReport(operation="release", digest="verified-lock", requires_confirmation=True,
+                            reason="仅处理保护锁。")
+        window.relay_task(self.task.id, "recover")
+        preview = window.sync_worker
+        with (patch("app.ui.main_window.PreviewDialog") as dialog,
+              patch.object(self.config, "save_recovered_connection", side_effect=OSError("fixture write failure")),
+              patch.object(window, "_message") as message):
+            dialog.return_value.exec.return_value = QDialog.DialogCode.Accepted
+            preview.complete_preview(report, report.reason)
+        self.assertIsNone(window.sync_worker)
+        self.assertIsNone(window.scheduler.queue.active_id)
+        self.assertIn("保留续作记录", message.call_args.args[1])
 
     def test_explicit_upload_and_download_buttons_preview_actual_direction(self):
         for direction, expected in (("upload", ("publish", "adopt")), ("download", ("return", "receive"))):

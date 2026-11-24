@@ -171,6 +171,7 @@ class ConfigV3Tests(unittest.TestCase):
         self.assertFalse(path.exists())
         self.assertEqual(fresh.url, "")
         self.assertEqual(fresh.username, "")
+        self.assertIs(fresh.connection_needs_confirmation, False)
         self.assertEqual(fresh.tasks, ())
         for key in ("mount.auto_mount", "app.start_with_windows"):
             self.assertIs(fresh.get(key), False)
@@ -204,8 +205,10 @@ class ConfigV3Tests(unittest.TestCase):
                 path.write_bytes(original)
                 config = Config(path)
                 self.assertEqual(config.load_error, "")
-                self.assertEqual(config.url, C.DEFAULT_URL)
-                self.assertEqual(config.username, "phonenas")
+                # Keep the v1.2.3 values visible while requiring review of the endpoint.
+                self.assertEqual(config.url, "http://100.109.166.11:8888")
+                self.assertEqual(config.username, "admin")
+                self.assertIs(config.connection_needs_confirmation, True)
                 self.assertIs(config.get("mount.auto_mount"), True)
                 self.assertIs(config.get("app.start_with_windows"), True)
                 if version in (None, 1):
@@ -216,6 +219,258 @@ class ConfigV3Tests(unittest.TestCase):
                 else:
                     self.assertEqual(config.tasks, ())
                 self.assertEqual(path.read_bytes(), original)
+
+    @unittest.skipUnless(os.name == "nt", "historical Windows binding")
+    def test_sparse_v1_keeps_historical_pending_identity_before_and_after_save(self) -> None:
+        from app.core.pending import PendingOperation
+        from app.core.relay import BaselineStore
+
+        path = Config().path
+        original = b'{"version":1}'
+        path.write_bytes(original)
+        task_id = "30e2b78aff805219828e8197885d513a"
+        legacy_source = Path(r"D:\LefeetHardware")
+        legacy_history = legacy_source.with_name("LefeetHardware.PhoneNAS-history-30e2b78a")
+        journal = path.parent / "baselines" / f"{task_id}.pending.json"
+        journal.parent.mkdir()
+        # Fixture uses the values decoded by v1.2.3, not the current Config defaults.
+        empty = {"files": {}, "directories": []}
+        journal.write_text(json.dumps({
+            "version": 1, "operation": "publish", "local": empty, "remote": empty,
+            "generation": "1" * 32, "lock_token": "2" * 32, "stamp": "2026-11-20_100000",
+            "binding": {"task_id": task_id, "direction": "upload", "url": "http://100.109.166.11:8888",
+                        "username": "admin", "dataset_id": "050b8cb0cc6f5b888b7326455bc17fc5",
+                        "sync_identity": "763e592025e5579d90cae02e6491486e",
+                        "local_path": str(legacy_source), "local_history_path": str(legacy_history),
+                        "remote_path": "backup/work", "versions_path": "backup/work-versions",
+                        "excludes": list(C.RECOMMENDED_EXCLUDES)},
+        }), encoding="utf-8")
+        journal_bytes = journal.read_bytes()
+        real_resolve = Path.resolve
+
+        def resolve(path: Path, *args, **kwargs):
+            if path in (legacy_source, legacy_history, Path("X:/")):
+                return path  # Never open the historical real source or actual mount.
+            return real_resolve(path, *args, **kwargs)
+
+        with patch.object(Path, "resolve", resolve), patch.object(C, "DEFAULT_LOCAL_PATH", str(legacy_source)):
+            config = Config(path)
+            self.assertEqual(config.load_error, "")
+            self.assertIs(config.connection_needs_confirmation, False)
+            self.assertEqual(config.tasks[0].id, task_id)
+            pending = PendingOperation(BaselineStore(journal.parent, config.tasks[0], config))
+            self.assertEqual(pending.load()["lock_token"], "2" * 32)
+            draft = config.snapshot()
+            draft.set("app.minimize_to_tray", False)
+            draft.save()
+            reloaded = Config(path)
+            self.assertEqual(reloaded.tasks, config.tasks)
+            self.assertEqual(PendingOperation(BaselineStore(journal.parent, reloaded.tasks[0], reloaded))
+                             .load()["lock_token"], "2" * 32)
+        self.assertEqual(path.with_suffix(".v1-backup").read_bytes(), original)
+        self.assertEqual(journal.read_bytes(), journal_bytes)
+
+    def _write_preview_publish(self, config: Config, task: MirrorTask, *,
+                               url: str = "https://100.109.166.11:18889",
+                               username: str = "phonenas") -> Path:
+        from app.core.relay import BaselineStore
+
+        endpoint = config.snapshot()
+        endpoint.set("nas.url", url)
+        endpoint.set("nas.username", username)
+        root = config.path.parent / "baselines"
+        journal = root / f"{task.id}.pending.json"
+        root.mkdir(exist_ok=True)
+        empty = {"files": {}, "directories": []}
+        journal.write_text(json.dumps({
+            "version": 1, "operation": "publish", "local": empty, "remote": empty,
+            "generation": "3" * 32, "lock_token": "4" * 32, "stamp": "2026-11-20_100000",
+            "binding": BaselineStore(root, task, endpoint).binding,
+        }), encoding="utf-8")
+        return journal
+
+    def test_sparse_preview_profile_recovers_pending_binding_without_rebinding_task(self) -> None:
+        from app.core.pending import PendingOperation
+        from app.core.relay import BaselineStore
+
+        profile = Config()
+        task = new_task(str(profile.path.parent / "source"))
+        journal = self._write_preview_publish(profile, task)
+        original = json.dumps({"version": 2, "mirror": {"tasks": [task.to_dict()]}}).encode("utf-8")
+        profile.path.write_bytes(original)
+        journal_bytes = journal.read_bytes()
+
+        profile.load()
+        self.assertEqual(profile.load_error, "")
+        self.assertEqual((profile.url, profile.username), ("https://100.109.166.11:18889", "phonenas"))
+        self.assertIs(profile.connection_needs_confirmation, False)
+        self.assertEqual(profile.path.read_bytes(), original)
+        backup = profile.path.with_name("exported.json")
+        profile.export_to(backup)
+        with self.assertRaisesRegex(ValueError, task.id):
+            profile.import_from(backup)
+        self.assertEqual(profile.path.read_bytes(), original)
+        self.assertEqual(journal.read_bytes(), journal_bytes)
+        draft = profile.snapshot()
+        draft.set("app.minimize_to_tray", False)
+        draft.save()
+
+        loaded = Config(profile.path)
+        self.assertIs(loaded.connection_needs_confirmation, False)
+        self.assertEqual(loaded.tasks, (task,))
+        self.assertEqual((loaded.url, loaded.username), ("https://100.109.166.11:18889", "phonenas"))
+        self.assertEqual(PendingOperation(BaselineStore(journal.parent, task, loaded)).load()["lock_token"], "4" * 32)
+        self.assertEqual(journal.read_bytes(), journal_bytes)
+        self.assertEqual(loaded.path.with_suffix(".v2-backup").read_bytes(), original)
+
+    def test_preview_connection_can_be_recovered_from_control_pending_record(self) -> None:
+        from app.core.pending import PendingOperation
+        from app.core.relay import BaselineStore
+
+        profile = Config()
+        task = new_task(str(profile.path.parent / "source"))
+        endpoint = profile.snapshot()
+        endpoint.set("nas.url", "https://100.109.166.11:18889")
+        endpoint.set("nas.username", "phonenas")
+        journal = PendingOperation(BaselineStore(profile.path.parent / "baselines", task, endpoint))
+        journal.save_control("initialize_baseline", "4" * 32, registration=True)
+        original = journal.path.read_bytes()
+        profile.path.write_text(json.dumps({"version": 3, "nas": {"username": "phonenas"},
+                                            "mirror": {"tasks": [task.to_dict()]}}), encoding="utf-8")
+
+        profile.load()
+        self.assertIs(profile.connection_needs_confirmation, False)
+        self.assertEqual(profile.url, "https://100.109.166.11:18889")
+        draft = profile.snapshot()
+        draft.set("nas.url", "https://changed.invalid")
+        with self.assertRaisesRegex(ValueError, task.id):
+            draft.save()
+        draft = profile.snapshot()
+        self.assertTrue(draft.save_recovered_connection())
+        profile.apply_snapshot(draft)
+        self.assertEqual(journal.path.read_bytes(), original)
+        journal.clear()  # An approved release-only recovery needs no task-success save.
+        restarted = Config(profile.path)
+        self.assertFalse(restarted.connection_needs_confirmation)
+        self.assertEqual((restarted.url, restarted.username), ("https://100.109.166.11:18889", "phonenas"))
+        self.assertEqual(restarted.tasks, (task,))
+        self.assertFalse(restarted.save_recovered_connection())
+
+    def test_recovered_connection_write_requires_original_bytes_and_still_valid_pending(self) -> None:
+        profile = Config()
+        task = new_task(str(profile.path.parent / "source"))
+        journal = self._write_preview_publish(profile, task)
+        journal_bytes = journal.read_bytes()
+        original = json.dumps({"version": 3, "mirror": {"tasks": [task.to_dict()]}}).encode("utf-8")
+        profile.path.write_bytes(original)
+        profile.load()
+        self.assertFalse(profile.connection_needs_confirmation)
+
+        profile.path.write_bytes(original + b"\n")
+        with self.assertRaises(ValueError):
+            profile.save_recovered_connection()
+        self.assertEqual(profile.path.read_bytes(), original + b"\n")
+        self.assertEqual(journal.read_bytes(), journal_bytes)
+        profile.path.write_bytes(original)
+
+        journal.unlink()
+        with self.assertRaises(ValueError):
+            profile.save_recovered_connection()
+        with self.assertRaises(ValueError):
+            profile.save()
+        self.assertEqual(profile.path.read_bytes(), original)
+        self.assertFalse(journal.exists())
+        self.assertTrue(Config(profile.path).connection_needs_confirmation)
+
+        journal.write_bytes(journal_bytes)
+        moved = profile.snapshot()
+        moved.set("nas.url", "https://different.example.invalid")
+        with self.assertRaises(ValueError):
+            moved.save_recovered_connection()
+        self.assertEqual(profile.path.read_bytes(), original)
+        self.assertEqual(journal.read_bytes(), journal_bytes)
+        self.assertTrue(profile.save_recovered_connection())
+
+    def test_malformed_pending_payload_cannot_confirm_matching_preview_identity(self) -> None:
+        profile = Config()
+        task = new_task(str(profile.path.parent / "source"))
+        journal = self._write_preview_publish(profile, task)
+        invalid = json.loads(journal.read_bytes())
+        invalid["remote"]["files"]["a.txt"] = {"size": 1, "sha256": "not-a-digest"}
+        journal.write_text(json.dumps(invalid), encoding="utf-8")
+        journal_bytes = journal.read_bytes()
+        original = json.dumps({"version": 3, "mirror": {"tasks": [task.to_dict()]}}).encode("utf-8")
+        profile.path.write_bytes(original)
+
+        profile.load()
+        self.assertIs(profile.connection_needs_confirmation, True)
+        draft = profile.snapshot()
+        draft.set("nas.url", "https://100.109.166.11:18889")
+        draft.set("nas.username", "phonenas")
+        with self.assertRaisesRegex(ValueError, task.id):
+            draft.confirm_connection()
+        self.assertIs(draft.connection_needs_confirmation, True)
+        self.assertEqual(profile.path.read_bytes(), original)
+        self.assertEqual(journal.read_bytes(), journal_bytes)
+
+    def test_manual_confirmation_can_restore_only_a_valid_matching_old_pending_binding(self) -> None:
+        profile = Config()
+        task = new_task(str(profile.path.parent / "source"))
+        url, username = "https://old.example.invalid:18889", "phone-account"
+        journal = self._write_preview_publish(profile, task, url=url, username=username)
+        journal_bytes = journal.read_bytes()
+        original = json.dumps({"version": 3, "nas": {"url": url},
+                               "mirror": {"tasks": [task.to_dict()]}}).encode("utf-8")
+        profile.path.write_bytes(original)
+        profile.load()
+        self.assertIs(profile.connection_needs_confirmation, True)
+        self.assertEqual((profile.url, profile.username), (url, "admin"))
+
+        wrong = profile.snapshot()
+        with self.assertRaisesRegex(ValueError, task.id):
+            wrong.confirm_connection()
+        self.assertIs(wrong.connection_needs_confirmation, True)
+        self.assertEqual(profile.path.read_bytes(), original)
+
+        draft = profile.snapshot()
+        draft.set("nas.username", username)
+        with self.assertRaisesRegex(ValueError, task.id):
+            draft.save()  # Filling in the value alone is not an approval.
+        draft.confirm_connection()
+        self.assertIs(draft.connection_needs_confirmation, False)
+        self.assertIs(profile.connection_needs_confirmation, True)
+        draft.save()
+        profile.apply_snapshot(draft)
+
+        loaded = Config(profile.path)
+        self.assertEqual((loaded.url, loaded.username), (url, username))
+        self.assertIs(loaded.connection_needs_confirmation, False)
+        self.assertIs(profile.connection_needs_confirmation, False)
+        self.assertEqual(loaded.tasks, (task,))
+        self.assertEqual(journal.read_bytes(), journal_bytes)
+
+    def test_conflicting_pending_records_leave_sparse_connection_unapproved(self) -> None:
+        profile = Config()
+        preview = new_task(str(profile.path.parent / "preview"))
+        legacy = new_task(str(profile.path.parent / "legacy"))
+        preview_journal = self._write_preview_publish(profile, preview)
+        legacy_journal = self._write_preview_publish(profile, legacy, url="http://100.109.166.11:8888", username="admin")
+        originals = {item: item.read_bytes() for item in (preview_journal, legacy_journal)}
+        profile.path.write_text(json.dumps({"version": 3, "mirror": {"tasks": [
+            preview.to_dict(), legacy.to_dict(),
+        ]}}), encoding="utf-8")
+        profile.load()
+        self.assertIs(profile.connection_needs_confirmation, True)
+        draft = profile.snapshot()
+        draft.set("app.minimize_to_tray", False)
+        draft.save()
+        loaded = Config(profile.path)
+        self.assertIs(loaded.connection_needs_confirmation, True)
+        self.assertIs(loaded.get("app.minimize_to_tray"), False)
+        with self.assertRaisesRegex(ValueError, "未完成操作记录"):
+            loaded.confirm_connection()
+        for item, original in originals.items():
+            self.assertEqual(item.read_bytes(), original)
 
     def test_explicit_saved_connection_and_startup_settings_survive_load_and_save(self) -> None:
         root = Config().path.parent
@@ -238,10 +493,189 @@ class ConfigV3Tests(unittest.TestCase):
                 config = Config(path)
                 self.assertEqual(config.load_error, "")
                 self.assertEqual({key: config.get(key) for key in expected}, expected)
+                self.assertIs(config.connection_needs_confirmation, False)
                 config.save()
                 reloaded = Config(path)
                 self.assertEqual(reloaded.load_error, "")
                 self.assertEqual({key: reloaded.get(key) for key in expected}, expected)
+                self.assertIs(reloaded.connection_needs_confirmation, False)
+
+    def test_import_of_sparse_legacy_profile_preserves_defaults_and_existing_password(self) -> None:
+        config = Config()
+        config.set("nas.password_enc", "opaque-existing-dpapi")
+        config.save()
+        incoming = config.path.with_name("legacy-import.json")
+        incoming.write_text('{"version":1}', encoding="utf-8")
+        with patch.object(C, "DEFAULT_LOCAL_PATH", str(config.path.parent / "legacy-source")):
+            config.import_from(incoming)
+        loaded = Config(config.path)
+        self.assertEqual(loaded.url, "http://100.109.166.11:8888")
+        self.assertEqual(loaded.username, "admin")
+        self.assertIs(config.connection_needs_confirmation, True)
+        self.assertIs(loaded.connection_needs_confirmation, True)
+        self.assertEqual(loaded.get("nas.password_enc"), "opaque-existing-dpapi")
+        self.assertEqual(loaded.tasks[0].local_path, str(config.path.parent / "legacy-source"))
+
+    def test_sparse_import_does_not_use_pending_evidence_next_to_the_import_source(self) -> None:
+        target = Config()
+        incoming = Config(target.path.parent / "other-device" / "profile.json")
+        incoming.path.parent.mkdir()
+        task = new_task(str(incoming.path.parent / "work"))
+        journal = self._write_preview_publish(incoming, task)
+        original = json.dumps({"version": 3, "mirror": {"tasks": [task.to_dict()]}}).encode("utf-8")
+        incoming.path.write_bytes(original)
+        journal_bytes = journal.read_bytes()
+
+        target.import_from(incoming.path)
+
+        self.assertIs(target.connection_needs_confirmation, True)
+        self.assertEqual((target.url, target.username), ("http://100.109.166.11:8888", "admin"))
+        self.assertEqual(target.tasks[0].id, task.id)
+        self.assertNotEqual(target.tasks[0].sync_identity, task.sync_identity)
+        self.assertEqual(incoming.path.read_bytes(), original)
+        self.assertEqual(journal.read_bytes(), journal_bytes)
+
+    def test_import_and_export_of_unreviewed_connection_never_approve_the_display_values(self) -> None:
+        profile = Config()
+        source = profile.path.with_name("sparse.json")
+        source.write_text('{"version":3,"nas":{"username":"kept-user"}}', encoding="utf-8")
+        profile.import_from(source)
+        self.assertIs(profile.connection_needs_confirmation, True)
+        draft = profile.snapshot()
+        draft.set("app.minimize_to_tray", False)
+        draft.set("nas.url", "https://manually-entered.example.invalid")
+        draft.save()
+        loaded = Config(profile.path)
+        self.assertIs(loaded.connection_needs_confirmation, True)
+        self.assertEqual(loaded.url, "https://manually-entered.example.invalid")
+        exported = profile.path.with_name("portable.json")
+        loaded.export_to(exported)
+        target = Config(profile.path.with_name("elsewhere.json"))
+        target.import_from(exported)
+        self.assertIs(target.connection_needs_confirmation, True)
+        self.assertEqual((target.url, target.username), (loaded.url, "kept-user"))
+
+        explicit = target.snapshot()
+        explicit.confirm_connection()
+        self.assertIs(target.connection_needs_confirmation, True)
+        self.assertIs(explicit.connection_needs_confirmation, False)
+        explicit.save()
+        target.apply_snapshot(explicit)
+        self.assertIs(target.connection_needs_confirmation, False)
+        self.assertIs(Config(target.path).connection_needs_confirmation, False)
+
+    def test_unreviewed_local_certificate_survives_preferences_save_until_original_url_is_confirmed(self) -> None:
+        from test_https import PHONE_CERT
+
+        path = Config().path
+        endpoint = "https://phone.example.invalid:18889/dav"
+        original = json.dumps({"version": 3, "nas": {"username": "phone-user",
+                               "tls_url": endpoint, "tls_cert": PHONE_CERT}}).encode("utf-8")
+        path.write_bytes(original)
+        config = Config(path)
+        self.assertEqual(config.load_error, "")
+        self.assertIs(config.connection_needs_confirmation, True)
+        self.assertEqual(config.trusted_certificate_for(endpoint), "")
+        self.assertEqual(path.read_bytes(), original)
+
+        preferences = config.snapshot()
+        preferences.set("app.minimize_to_tray", False)
+        preferences.save()
+        reviewed = Config(path)
+        self.assertIs(reviewed.get("app.minimize_to_tray"), False)
+        reviewed.set("nas.url", endpoint)
+        self.assertEqual(reviewed.trusted_certificate_for(endpoint), "")
+        reviewed.confirm_connection()
+        self.assertEqual(reviewed.trusted_certificate_for(endpoint), PHONE_CERT)
+        reviewed.save()
+        self.assertEqual(Config(path).trusted_certificate_for(endpoint), PHONE_CERT)
+
+    def test_confirming_another_url_clears_dormant_certificate_even_before_save(self) -> None:
+        from test_https import PHONE_CERT
+
+        path = Config().path
+        endpoint = "https://phone.example.invalid/dav"
+        path.write_text(json.dumps({"version": 3, "nas": {"username": "phone-user",
+                                   "tls_url": endpoint, "tls_cert": PHONE_CERT}}), encoding="utf-8")
+        config = Config(path)
+        config.set("nas.url", endpoint + "/other")
+        config.confirm_connection()
+        self.assertFalse(config.connection_needs_confirmation)
+        config.set("nas.url", endpoint)
+        self.assertEqual(config.trusted_certificate_for(endpoint), "")
+        config.save()
+        self.assertEqual(Config(path).trusted_certificate_for(endpoint), "")
+
+    def test_import_may_only_retain_local_trust_without_approving_an_unreviewed_url(self) -> None:
+        from test_https import PHONE_CERT, REPLACEMENT_CERT
+
+        profile = Config()
+        endpoint = "https://phone.example.invalid/dav"
+        profile.path.write_text(json.dumps({"version": 3, "nas": {"username": "phone-user",
+                                            "tls_url": endpoint, "tls_cert": PHONE_CERT}}), encoding="utf-8")
+        profile.load()
+        exported = profile.path.with_name("exported.json")
+        profile.export_to(exported)
+        exported_nas = json.loads(exported.read_bytes())["nas"]
+        self.assertNotIn("tls_url", exported_nas)
+        self.assertNotIn("tls_cert", exported_nas)
+        incoming = profile.path.with_name("incoming.json")
+        nas = {"url": endpoint, "username": "phone-user", "tls_url": endpoint, "tls_cert": REPLACEMENT_CERT}
+        incoming.write_text(json.dumps({"version": 3, "nas": nas}), encoding="utf-8")
+        fresh = Config(profile.path.with_name("fresh.json"))
+        fresh.import_from(incoming)
+        self.assertEqual(fresh.trusted_certificate_for(endpoint), "")
+        profile.import_from(incoming)
+        self.assertTrue(profile.connection_needs_confirmation)
+        self.assertEqual(profile.trusted_certificate_for(endpoint), "")
+
+        del nas["url"]
+        incoming.write_text(json.dumps({"version": 3, "nas": nas}), encoding="utf-8")
+        profile.import_from(incoming)
+        profile = Config(profile.path)
+        self.assertTrue(profile.connection_needs_confirmation)
+        self.assertEqual(profile.trusted_certificate_for(endpoint), "")
+        profile.set("nas.url", endpoint)
+        profile.confirm_connection()
+        self.assertEqual(profile.trusted_certificate_for(endpoint), PHONE_CERT)
+
+    def test_settings_reuses_local_certificate_only_for_its_original_address(self) -> None:
+        from PySide6.QtCore import QCoreApplication, QEvent
+        from PySide6.QtTest import QTest
+        from PySide6.QtWidgets import QApplication, QMessageBox
+        from app.ui.pages.settings import SettingsPage
+        from test_https import PHONE_CERT
+
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        app = QApplication.instance() or QApplication([])
+        profile = Config()
+        endpoint = "https://phone.example.invalid/dav"
+        profile.path.write_text(json.dumps({"version": 3, "nas": {"username": "phone-user",
+                                            "tls_url": endpoint, "tls_cert": PHONE_CERT}}), encoding="utf-8")
+        profile.load()
+        page = SettingsPage(profile)
+        self.addCleanup(app.processEvents)
+        self.addCleanup(QCoreApplication.sendPostedEvents, None, QEvent.Type.DeferredDelete)
+        self.addCleanup(page.deleteLater)
+        self.assertEqual(page.certificate_input.certificate, "")
+        page.url_edit.setText(endpoint)
+        self.assertEqual(page.certificate_input.certificate, PHONE_CERT)
+        self.assertIn("待确认", page.certificate_input.summary.text())
+        page.url_edit.setText(endpoint + "/other")
+        self.assertEqual(page.certificate_input.certificate, "")
+        page.url_edit.setText(endpoint + "/")
+        self.assertEqual(page.certificate_input.certificate, PHONE_CERT)
+        self.assertEqual(profile.trusted_certificate_for(endpoint), "")
+
+        with patch.object(QMessageBox, "exec", return_value=QMessageBox.StandardButton.Yes.value), \
+                patch("app.ui.pages.settings.set_autostart", return_value=(True, "")):
+            page.save_button.click()
+            for _ in range(200):
+                if not page.busy:
+                    break
+                QTest.qWait(10)
+        self.assertFalse(page.busy, page.notice_label.text())
+        self.assertEqual(Config(profile.path).trusted_certificate_for(endpoint), PHONE_CERT)
 
     def test_read_only_mount_defaults_are_safe_for_fresh_configs_and_compatible_for_migrations(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

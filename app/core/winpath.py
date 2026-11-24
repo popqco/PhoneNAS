@@ -15,8 +15,8 @@ _LOG = logging.getLogger(__name__)
 def extended_path(value: str | os.PathLike[str]) -> str:
     r"""Return a Win32 extended-length spelling for filesystem API calls.
 
-    The 260-character limit applies to several Python/Windows directory APIs
-    even when rclone itself can handle longer paths.  The ``\\?\`` prefix
+    The 260 UTF-16 code-unit limit applies to several Python/Windows directory
+    APIs even when rclone itself can handle longer paths.  The ``\\?\`` prefix
     bypasses that limit; Unix paths are returned unchanged.
     """
     text = os.fspath(value)
@@ -41,7 +41,8 @@ def filesystem_path(value: str | os.PathLike[str]) -> Path:
     if os.name != "nt" or text.startswith("\\\\?\\"):
         return Path(text)
     absolute = os.path.abspath(text)
-    if len(absolute) < 248:
+    # Win32 counts UTF-16 code units; supplementary characters take two.
+    if len(absolute.encode("utf-16-le", errors="surrogatepass")) // 2 < 248:
         return Path(text)
     return Path(extended_path(absolute))
 

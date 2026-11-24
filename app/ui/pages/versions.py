@@ -29,6 +29,8 @@ from app.core.tasks import MirrorTask
 from app.ui.widgets import Card, ElidedLabel, FlowLayout, Header, button, label
 
 
+_REMOTE_CONNECTION_NOTICE = "手机历史需要已确认的连接。请到「设置」核对连接后保存，或切换到本地接收历史。"
+
 # Parentless QThreads must outlive a page that is unexpectedly deleted. Normal
 # shutdown reaps them after wait() succeeds; never destroy/terminate a live thread.
 _LIVE_WORKERS: set[_HistoryWorker] = set()
@@ -316,6 +318,13 @@ class VersionsPage(QWidget):
             ancestor = ancestor.parentWidget()
         return True
 
+    def _remote_needs_confirmation(self) -> bool:
+        return self._location() == "remote" and self.config.connection_needs_confirmation
+
+    def _action_allowed(self) -> bool:
+        return (not self.busy and not self._sync_busy and self._online_allowed()
+                and not self._remote_needs_confirmation())
+
     def _current_task(self) -> MirrorTask | None:
         task_id = self.task_combo.currentData()
         task = self.config.get_task(task_id) if task_id else None
@@ -403,6 +412,8 @@ class VersionsPage(QWidget):
     def _idle_status(self) -> str:
         if not self._online_allowed():
             return "离线安全模式：仅预览界面，不读取本地或手机历史，也不启动网络操作。"
+        if self._remote_needs_confirmation():
+            return "手机连接待确认。"
         if self._current_task() is None:
             return "请先添加一个文件夹任务。"
         if self._location() == "local":
@@ -429,7 +440,7 @@ class VersionsPage(QWidget):
         return version
 
     def _update_actions(self, *_args) -> None:
-        available = self._online_allowed() and not self.busy and not self._sync_busy
+        available = self._action_allowed()
         version = self._selected()
         files_ready = version is not None and self._files_version == version
         self.task_combo.setEnabled(not self.busy and not self._shutting_down)
@@ -453,6 +464,8 @@ class VersionsPage(QWidget):
             reason = "历史操作正在进行，完成并退出后台后才可再次操作。取消不会回滚已完成的恢复或删除。"
         elif self._sync_busy:
             reason = "同步或其他连接操作正在进行，历史操作暂不可用；结束后可继续。"
+        elif self._remote_needs_confirmation():
+            reason = _REMOTE_CONNECTION_NOTICE
         elif self._current_task() is None:
             reason = "请先添加或重新选择文件夹任务。"
         else:
@@ -463,7 +476,7 @@ class VersionsPage(QWidget):
             control.setToolTip(reason)
 
     def refresh(self) -> None:
-        if self.busy or self._sync_busy or not self._online_allowed():
+        if not self._action_allowed():
             return
         task = self._current_task()
         if task is None:
@@ -480,7 +493,7 @@ class VersionsPage(QWidget):
             self._start_operation("files", version=version)
 
     def _start_operation(self, operation: str, *, version=None, destination=None, files=None) -> bool:
-        if self.busy or self._sync_busy or not self._online_allowed():
+        if not self._action_allowed():
             return False
         task = self._current_task()
         if task is None:
@@ -594,7 +607,7 @@ class VersionsPage(QWidget):
 
     def _choose_restore(self, files) -> None:
         task, version = self._current_task(), self._selected()
-        if task is None or version is None or self._files_version != version or self.busy or self._sync_busy or not self._online_allowed():
+        if task is None or version is None or self._files_version != version or not self._action_allowed():
             return
         generation = self._generation
         directory = QFileDialog.getExistingDirectory(
@@ -609,7 +622,7 @@ class VersionsPage(QWidget):
 
     def _delete(self) -> None:
         task, version = self._current_task(), self._selected()
-        if task is None or version is None or self.busy or self._sync_busy or not self._online_allowed():
+        if task is None or version is None or not self._action_allowed():
             return
         generation = self._generation
         answer = QMessageBox.question(

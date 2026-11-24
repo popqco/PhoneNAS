@@ -67,7 +67,12 @@ def _route(method):
             target = self.requestline.split()[1]
             if self.command == "OPTIONS" and target == "*":
                 target = "/"
-            method(self, *self._lookup(target))
+            path, info = self._lookup(target)
+            if self.server.reject is not None:
+                status = self.server.reject(self.command, target, self.headers)
+                if status is not None:
+                    raise _DAVError(status)
+            method(self, path, info)
         except _DAVError as error:
             self._reply(error.args[0])
         except UnicodeDecodeError:
@@ -265,9 +270,10 @@ class _Server(TCPServer):
     # Serial request handling keeps filesystem operations ordered and MKCOL exclusive.
     request_queue_size = 32
 
-    def __init__(self, root, requests):
+    def __init__(self, root, requests, reject):
         self.root = root
         self.requests = requests
+        self.reject = reject
         super().__init__(("127.0.0.1", 0), _Handler)
         host, port = self.server_address
         self.authority = f"{host}:{port}"
@@ -275,12 +281,12 @@ class _Server(TCPServer):
 
 
 @contextmanager
-def serve_webdav(root: Path, *, requests: list[str] | None = None) -> Iterator[str]:
+def serve_webdav(root: Path, *, requests: list[str] | None = None, reject=None) -> Iterator[str]:
     """Yield an ephemeral HTTP endpoint; do not mutate the served tree concurrently."""
     root = root.resolve(strict=True)
     if not root.is_dir():
         raise NotADirectoryError(root)
-    with _Server(root, requests) as server:
+    with _Server(root, requests, reject) as server:
         thread = Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
         thread.start()
         try:

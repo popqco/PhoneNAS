@@ -49,7 +49,9 @@ class RcloneIsolationTests(unittest.TestCase):
             rule = "/part[\u2421].txt"
             command = ["lsjson", "phone:PCB\u200b", "--exclude", rule]
             with patch("app.core.rclone.rclone_exe", return_value=executable), \
-                    patch.dict(os.environ, {"RCLONE_EXCLUDE": "irrelevant", "RCLONE_WEBdav_URL": "invalid"}), \
+                    patch.dict(os.environ, {"RCLONE_EXCLUDE": "irrelevant", "RCLONE_WEBdav_URL": "invalid",
+                                            "RCLONE_NO_CHECK_CERTIFICATE": "true", "RCLONE_WEBDAV_AUTH_REDIRECT": "true",
+                                            "HTTPS_PROXY": "http://proxy.invalid", "SSL_CERT_FILE": "untrusted.pem"}), \
                     patch("app.core.rclone.subprocess.Popen") as spawn:
                 proc = spawn.return_value
                 proc.communicate.return_value = ("[]", "")
@@ -58,7 +60,7 @@ class RcloneIsolationTests(unittest.TestCase):
                 self.assertTrue(client.run(command, conf_path=private).ok)
                 args, options = spawn.call_args
                 self.assertEqual(args[0][1:1 + len(command)], command)
-                self.assertIn("--no-check-certificate", args[0])
+                self.assertNotIn("--no-check-certificate", args[0])
                 self.assertEqual(args[0][-2:], ["--config", str(private)])
                 self.assertNotIn("RCLONE_EXCLUDE", options["env"])
                 self.assertFalse(any(key.upper() == "RCLONE_WEBDAV_URL" for key in options["env"]))
@@ -66,8 +68,27 @@ class RcloneIsolationTests(unittest.TestCase):
                 mount = spawn.call_args.args[0]
                 self.assertNotIn("--local-encoding", mount)
                 self.assertNotIn("--webdav-encoding", mount)
-                self.assertIn("--no-check-certificate", mount)
+                self.assertNotIn("--no-check-certificate", mount)
                 self.assertEqual(mount[-2:], ["--config", str(private)])
+                self.assertFalse(any(key.upper().startswith("RCLONE_") or key.upper() in {"HTTPS_PROXY", "SSL_CERT_FILE"}
+                                     for key in spawn.call_args.kwargs["env"]))
+
+    def test_unconfirmed_legacy_address_cannot_start_network_commands(self):
+        with tempfile.TemporaryDirectory() as root:
+            base = Path(root)
+            path = base / "config.json"
+            path.write_text('{"version":3,"nas":{"username":"phone"}}', encoding="utf-8")
+            executable = base / "rclone.exe"
+            executable.touch()
+            client = Rclone(Config(path), conf_path=base / "rclone.conf")
+            with patch("app.core.rclone.rclone_exe", return_value=executable), \
+                    patch("app.core.rclone.subprocess.Popen") as spawn:
+                result = client.run(["lsd", "phone:"])
+                self.assertFalse(result.ok)
+                self.assertIn("核对", result.err)
+                with self.assertRaisesRegex(ValueError, "核对"):
+                    client.popen(["mount", "phone:", "W:"])
+                spawn.assert_not_called()
 
     def test_configuration_line_injection_is_rejected_before_obscuring(self):
         with tempfile.TemporaryDirectory() as root:

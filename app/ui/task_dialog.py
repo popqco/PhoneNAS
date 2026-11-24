@@ -290,7 +290,12 @@ class TaskDialog(QDialog):
         self.retention_spin.setMinimumHeight(44)
         self.retention_spin.setAccelerated(True)
         columns.addWidget(_field("同步间隔", self.interval_spin, f"{MIN_INTERVAL_MINUTES}–{MAX_INTERVAL_MINUTES} 分钟；每个任务单独计时。"), 0, 0)
-        columns.addWidget(_field("旧文件保留", self.retention_spin, "1–3650 天；仅清理此任务过期的旧文件。"), 0, 1)
+        columns.addWidget(_field(
+            "旧文件保留", self.retention_spin,
+            f"{MIN_RETENTION_DAYS}–{MAX_RETENTION_DAYS} 天。"
+            "原名协议下，仅在发布成功后自动清理本任务手机历史中的过期批次。"
+            "旧协议的手机历史和本地历史均不自动清理。",
+        ), 0, 1)
         columns.setColumnStretch(0, 1)
         columns.setColumnStretch(1, 1)
         layout.addLayout(columns)

@@ -79,7 +79,9 @@ class WebDAVFilenameTests(unittest.TestCase):
         if not getattr(type(self), "vendor_verified", False):
             with binary.open("rb") as stream:
                 actual = hashlib.file_digest(stream, "sha256").hexdigest()
-            self.assertEqual(actual, "acd80683e23151e93bbe0d6ffa74d26e542ec510332f630beecb9944f8d1a623",
+            manifest = Path(__file__).resolve().parents[1] / "build" / "vendor-checksums.json"
+            expected = json.loads(manifest.read_text(encoding="utf-8"))["rclone.exe"]
+            self.assertEqual(actual, expected.lower(),
                              "run build/fetch-vendor.ps1 to use the pinned Windows rclone for protocol testing")
             type(self).vendor_verified = True
         stack = ExitStack()
@@ -89,7 +91,9 @@ class WebDAVFilenameTests(unittest.TestCase):
         self.remote.mkdir()
         self.state = self.root / "baselines"
         self.requests = []
-        endpoint = stack.enter_context(serve_webdav(self.remote, requests=self.requests))
+        self.reject = lambda *_: None
+        endpoint = stack.enter_context(serve_webdav(self.remote, requests=self.requests,
+                                                    reject=lambda *args: self.reject(*args)))
 
         profile = self.root / "profile"
         profile.mkdir()
@@ -455,6 +459,38 @@ class WebDAVFilenameTests(unittest.TestCase):
         self.assertFalse(self.lock(task).exists())
         self.assertFalse(self.pending(task).exists())
 
+    def test_recovery_can_retry_a_failed_final_lock_check_without_replaying_files(self):
+        source = self.root / "office"
+        old, new = {"notes.txt": b"old"}, {"notes.txt": b"updated"}
+        _put(source, new)
+        task = new_task(str(source))
+        _put(self.remote / task.remote_path, old)
+        self._write_v1_interrupted_publish(task, local=_v1_snapshot(new), remote=_v1_snapshot(old))
+        recovery = self.engine(task, operation="recover")
+        report = self._assert_read_only_preview(recovery)
+        lock = f"/.phonenas/locks/{task.dataset_id}"
+        self.reject = lambda method, path, headers: (
+            503 if method == "PROPFIND" and path.rstrip("/") == lock and headers.get("Depth") == "1"
+            and _read_json(self.control(task))["phase"] == "ready" else None
+        )
+        with self.assertRaisesRegex(RuntimeError, "锁"):
+            recovery.execute(report)
+        self.assertEqual(_read_json(self.control(task))["phase"], "ready")
+        self.assertTrue(self.baseline(task).is_file())
+        self.assertTrue(self.lock(task).is_dir())
+        self.assertTrue(self.pending(task).is_file(), "retry proof must survive a failed release")
+
+        self.reject = lambda *_: None
+        _put(source, {"notes.txt": b"new local edits after the verified sync"})
+        retry = self.engine(task, operation="recover")
+        approved = self._assert_read_only_preview(retry)
+        self.assertTrue(approved.requires_confirmation)
+        self.assertEqual(approved.operation, "release")
+        retry.execute(approved)
+        self.assertFalse(self.lock(task).exists())
+        self.assertFalse(self.pending(task).exists())
+        self.assertEqual(_files(self.remote / task.remote_path), new)
+
     def test_recovery_never_replaces_a_modified_existing_history_file(self):
         source = self.root / "office"
         new, old = {"notes.txt": b"new draft"}, {"notes.txt": b"previous draft"}
@@ -507,6 +543,378 @@ class WebDAVFilenameTests(unittest.TestCase):
         self._write_v1_pending(peer, operation="receive", local=common, remote=common, generation=generation)
         self._assert_read_only_preview(self.engine(peer, operation="recover"), refusal="文件名协议")
 
+
+    def _crash_during_first_registration(self, task, *, write_state: bool = False, staging: bool = False,
+                                         initialize: bool = False, delete_version: str = ""):
+        import subprocess
+        import sys
+
+        # Use a real process exit so neither the dataset nor registration
+        # context manager gets a chance to release its WebDAV lock.
+        program = '''
+import json, os, sys
+from pathlib import Path
+from app.core.config import Config
+from app.core.history import HistoryService
+from app.core.rclone import Rclone
+from app.core.relay import _WebDAVDatasetLease
+from app.core.sync import SyncEngine
+from app.core.tasks import MirrorTask
+
+conf, endpoint, state_directory, task_json, write_state, staging, initialize, delete_version = sys.argv[1:]
+task = MirrorTask.from_dict(json.loads(task_json))
+config = Config(Path(conf).with_suffix('.json'))
+config.set('nas.url', endpoint)
+
+class InterruptedClient(Rclone):
+    def run(self, args, *positional, **options):
+        if args[0] == 'copyto' and args[2].endswith('/state.json'):
+            if write_state == '1':
+                result = super().run(args, *positional, **options)
+                if not result.ok:
+                    raise RuntimeError(result.err)
+            os._exit(42)
+        return super().run(args, *positional, **options)
+
+if staging == '1' or delete_version:
+    request = _WebDAVDatasetLease._request
+    interrupted_method = 'MOVE' if delete_version else 'MKCOL'
+
+    def interrupted_request(self, method, url, *args, **kwargs):
+        result = request(self, method, url, *args, **kwargs)
+        if method == interrupted_method and 'directory-registration' in url and result[0] == 201:
+            os._exit(42)
+        return result
+
+    _WebDAVDatasetLease._request = interrupted_request
+
+client = InterruptedClient(config, conf_path=Path(conf))
+engine = SyncEngine(client, task, state_directory=Path(state_directory))
+if delete_version:
+    HistoryService(client, task).delete(delete_version)
+elif initialize == '1':
+    engine.initialize_baseline(engine.preview_baseline_initialization())
+else:
+    engine.execute(engine.preview())
+'''
+        result = subprocess.run(
+            [sys.executable, "-c", program, str(self.root / "rclone.conf"), self.config.url,
+             str(self.state), json.dumps(task.to_dict()), str(int(write_state)), str(int(staging)),
+             str(int(initialize)), delete_version],
+            cwd=Path(__file__).resolve().parents[1], capture_output=True, timeout=90,
+        )
+        self.assertEqual(result.returncode, 42, result.stderr.decode("utf-8", errors="replace"))
+        self.assertTrue(self.pending(task).is_file())
+        self.assertTrue(self.lock(task).is_dir())
+        self.assertEqual(self.control(task).is_file(), write_state)
+
+    def test_interrupted_baseline_registration_can_release_owned_locks(self):
+        source, other = self.root / "office", self.root / "other"
+        content = {"notes.txt": b"identical work"}
+        _put(source, content)
+        _put(other, {"peer.txt": b"independent task"})
+        task, peer = new_task(str(source)), new_task(str(other))
+        mirror = self.remote / task.remote_path
+        _put(mirror, content)
+        self._crash_during_first_registration(task, initialize=True)
+        registration = self.lock(task).parent / "directory-registration"
+        self.assertTrue(registration.is_dir())
+        self.assertFalse(self.baseline(task).exists())
+
+        recovery = self.engine(task, operation="recover")
+        report = self._assert_read_only_preview(recovery)
+        self.assertEqual(report.operation, "release")
+        recovery.execute(report)
+        self.assertFalse(registration.exists())
+        self.assertFalse(self.lock(task).exists())
+        self.assertFalse(self.pending(task).exists())
+        self.assertEqual(_files(mirror), content)
+        self.assertEqual(_files(source), content)
+        self.run_sync(self.engine(peer))
+
+    def test_interrupted_history_delete_releases_locks_without_repeating_deletion(self):
+        source = self.root / "office"
+        task = new_task(str(source))
+        stamp = "2026-11-18_101000"
+        batch = self.remote / task.versions_path / stamp
+        archived = {"notes.txt": b"old work"}
+        _put(batch, archived)
+        self._write_v1_control(task, _v1_snapshot({}))
+        self._crash_during_first_registration(task, write_state=True, delete_version=stamp)
+        registration = self.lock(task).parent / "directory-registration"
+        self.assertTrue(registration.is_dir())
+        self.assertEqual(_files(batch), archived)
+
+        recovery = self.engine(task, operation="recover")
+        report = self._assert_read_only_preview(recovery)
+        self.assertEqual(report.operation, "release")
+        recovery.execute(report)
+        self.assertEqual(_files(batch), archived)
+        self.assertFalse(registration.exists())
+        self.assertFalse(self.lock(task).exists())
+        self.assertFalse(self.pending(task).exists())
+
+    def test_automatic_history_cleanup_keeps_proof_if_registration_release_fails(self):
+        source = self.root / "office"
+        _put(source, {"notes.txt": b"initial work"})
+        task = new_task(str(source))
+        self.run_sync(self.engine(task))
+        archive = self.remote / task.versions_path / "2001-01-02_030405"
+        _put(archive, {"notes.txt": b"expired work"})
+        changed = {"notes.txt": b"updated work"}
+        _put(source, changed)
+        registration = self.lock(task).parent / "directory-registration"
+        self.reject = lambda method, path, _: (
+            503 if method == "DELETE" and path.rstrip("/").endswith("/directory-registration") else None
+        )
+        with self.assertRaisesRegex(RuntimeError, "登记锁.*待确认"):
+            self.run_sync(self.engine(task))
+        self.assertTrue(registration.is_dir())
+        self.assertTrue(self.lock(task).is_dir())
+        self.assertTrue(self.pending(task).is_file())
+        self.assertEqual(_files(self.remote / task.remote_path), changed)
+
+        self.reject = lambda *_: None
+        recovery = self.engine(task, operation="recover")
+        report = self._assert_read_only_preview(recovery)
+        self.assertEqual(report.operation, "release")
+        # An independently created archive must not enter a cleanup retry.
+        _put(archive, {"notes.txt": b"keep this batch"})
+        recovery.execute(report)
+        self.assertEqual(_files(archive), {"notes.txt": b"keep this batch"})
+        self.assertFalse(registration.exists())
+        self.assertFalse(self.lock(task).exists())
+        self.assertFalse(self.pending(task).exists())
+
+    def test_first_publish_recovers_registry_lock_before_state_write(self):
+        self._check_first_registration_recovery(write_state=False)
+
+    def test_first_publish_recovers_registry_lock_after_state_write(self):
+        self._check_first_registration_recovery(write_state=True)
+
+    def test_registration_can_be_released_without_replaying_changed_source(self):
+        source, other = self.root / "office", self.root / "other"
+        _put(source, {"notes.txt": b"original task"})
+        _put(other, {"peer.txt": b"independent task"})
+        task, peer = new_task(str(source)), new_task(str(other))
+        self._crash_during_first_registration(task)
+        initial = self.engine(task, operation="recover")
+        stale = initial.preview()
+        self.assertEqual(stale.operation, "publish")
+        _put(source, {"notes.txt": b"edited after interruption"})
+        with self.assertRaisesRegex(RuntimeError, "来源又被修改"):
+            initial.execute(stale)
+        self.assertTrue((self.lock(task).parent / "directory-registration").is_dir())
+
+        release = self.engine(task, operation="recover")
+        approved = self._assert_read_only_preview(release)
+        self.assertEqual(approved.operation, "release")
+        self.assertTrue(approved.requires_confirmation)
+        before = self.pending(task).read_bytes()
+        release.execute(approved)
+        self.assertFalse((self.lock(task).parent / "directory-registration").exists())
+        self.assertEqual(self.pending(task).read_bytes(), before)
+        self.assertTrue(self.lock(task).exists())
+        self.assertFalse((self.remote / task.remote_path).exists())
+        self.assertTrue(self.engine(task, operation="recover").preview().blocked)
+        self.run_sync(self.engine(peer))
+
+    def test_crash_before_registration_owner_does_not_lock_other_datasets(self):
+        source, other = self.root / "office", self.root / "other"
+        _put(source, {"notes.txt": b"original task"})
+        _put(other, {"notes.txt": b"independent task"})
+        task, peer = new_task(str(source)), new_task(str(other))
+        self._crash_during_first_registration(task, staging=True)
+        self.assertFalse((self.lock(task).parent / "directory-registration").exists())
+        self.run_sync(self.engine(peer))
+        self.run_sync(self.engine(task, operation="recover"))
+        self.assertFalse(self.pending(task).exists())
+        self.assertEqual(_files(self.remote / task.remote_path), {"notes.txt": b"original task"})
+
+    def test_recovery_releases_owned_registration_when_registry_has_filled(self):
+        source = self.root / "office"
+        _put(source, {"notes.txt": b"not yet uploaded"})
+        task = new_task(str(source))
+        self._crash_during_first_registration(task)
+        registration = self.lock(task).parent / "directory-registration"
+        registry = self.remote / ".phonenas" / "datasets"
+        # Model another task taking the last slot before the interrupted task's
+        # locked scope check. A failed first state write left an empty directory.
+        self.control(task).parent.rmdir()
+        for index in range(64):
+            (registry / f"{index:032x}").mkdir(parents=True)
+        recovery = self.engine(task, operation="recover")
+        approved = self._assert_read_only_preview(recovery)
+        self.assertFalse(approved.blocked, approved.reason)
+        with self.assertRaisesRegex(RuntimeError, "登记.*已满"):
+            recovery.execute(approved)
+        self.assertFalse(registration.exists())
+        self.assertTrue(self.pending(task).is_file())
+        self.assertTrue(self.lock(task).is_dir())
+        self.assertFalse((self.remote / task.remote_path).exists())
+
+    def _check_first_registration_recovery(self, *, write_state: bool):
+        source, other = self.root / "office", self.root / "other"
+        _put(source, {"notes.txt": b"before crash"})
+        _put(other, {"notes.txt": b"independent publication"})
+        task, peer = new_task(str(source)), new_task(str(other))
+        self._crash_during_first_registration(task, write_state=write_state)
+        registry_lock = self.lock(task).parent / "directory-registration"
+        owner = registry_lock / "owner.json"
+        proof = owner.read_bytes()
+        self.assertFalse((self.remote / task.remote_path).exists())
+
+        independent = self.engine(peer)
+        with self.assertRaisesRegex(RuntimeError, "锁"):
+            self.run_sync(independent)
+        self.assertEqual(owner.read_bytes(), proof)
+        self.assertFalse(self.pending(peer).exists())
+
+        # Even the original dataset lease does not authorize taking someone
+        # else's registration lock. The old token must match both records.
+        record = json.loads(proof)
+        record["token"] = "f" * 32
+        _write_json(owner, record)
+        recovery = self.engine(task, operation="recover")
+        with self.assertRaisesRegex(RuntimeError, "所有者|所有权"):
+            self.run_sync(recovery)
+        self.assertEqual(_read_json(owner), record)
+        self.assertTrue(self.pending(task).exists())
+        self.assertFalse((self.remote / task.remote_path).exists())
+        owner.write_bytes(proof)
+
+        if write_state:
+            unknown = registry_lock / "unexpected.json"
+            unknown.write_bytes(b"unrelated control record")
+            with self.assertRaisesRegex(RuntimeError, "不会删除"):
+                self.run_sync(self.engine(task, operation="recover"))
+            self.assertEqual(unknown.read_bytes(), b"unrelated control record")
+            self.assertEqual(owner.read_bytes(), proof)
+            unknown.unlink()
+        if not write_state:
+            # An unrelated archive may appear after intent but before any v2
+            # state exists. Recovery must not reclassify it or expire it.
+            old_archive = self.remote / task.versions_path / "2000-01-02_030405"
+            _put(old_archive, {"old.txt": b"not from the interrupted publication"})
+            with self.assertRaisesRegex(RuntimeError, "首次发布.*已变化"):
+                self.run_sync(self.engine(task, operation="recover"))
+            old_file = old_archive / "old.txt"
+            self.assertEqual(old_file.read_bytes(), b"not from the interrupted publication")
+            self.assertFalse(self.control(task).exists())
+            self.assertTrue(self.pending(task).exists())
+            self.assertFalse(registry_lock.exists())
+            old_file.unlink()
+            old_archive.rmdir()
+
+        recovery = self.engine(task, operation="recover")
+        approved = self._assert_read_only_preview(recovery)
+        self.assertFalse(approved.blocked, approved.reason)
+        self.assertTrue(approved.requires_confirmation)
+        recovery.execute(approved)
+        self.assertFalse(registry_lock.exists())
+        self.assertFalse(self.pending(task).exists())
+        self.assertFalse(self.lock(task).exists())
+        self.assertEqual(_files(self.remote / task.remote_path), {"notes.txt": b"before crash"})
+        self.run_sync(independent)
+        self.assertEqual(_files(self.remote / peer.remote_path), {"notes.txt": b"independent publication"})
+
+    def test_explicitly_unsupported_registration_leaves_task_unlocked(self):
+        source = self.root / "office"
+        _put(source, {"notes.txt": b"publication"})
+        task = new_task(str(source))
+        engine = self.engine(task)
+        report = engine.preview()
+        self.reject = lambda method, path, _: (
+            405 if method == "MOVE" and "directory-registration-stage-" in path else None
+        )
+        with self.assertRaisesRegex(RuntimeError, "405"):
+            engine.execute(report)
+        self.assertFalse(self.pending(task).exists())
+        self.assertFalse(self.lock(task).exists())
+        self.assertFalse(self.control(task).exists())
+        self.assertFalse((self.remote / task.remote_path).exists())
+        self.reject = lambda *_: None
+        self.run_sync(self.engine(task))
+
+    def test_first_publish_refuses_to_overfill_registry(self):
+        source = self.root / "office"
+        _put(source, {"notes.txt": b"new publication"})
+        task = new_task(str(source))
+        registry = self.remote / ".phonenas" / "datasets"
+        for index in range(64):
+            (registry / f"{index:032x}").mkdir(parents=True)
+
+        try:
+            self._assert_read_only_preview(self.engine(task), refusal="登记.*已满")
+        finally:
+            self.assertEqual(len(list(registry.iterdir())), 64)
+            self.assertFalse(self.control(task).exists())
+            self.assertFalse(self.pending(task).exists())
+            self.assertFalse((self.remote / task.remote_path).exists())
+
+    def test_first_publish_rechecks_capacity_under_registration_lock(self):
+        source = self.root / "office"
+        _put(source, {"notes.txt": b"new publication"})
+        task = new_task(str(source))
+        engine = self.engine(task)
+        approved = engine.preview()
+        registry = self.remote / ".phonenas" / "datasets"
+        registration = self.lock(task).parent / "directory-registration"
+        run = self.client.run
+        filled = False
+
+        def register_competing_tasks(args, *positional, **options):
+            nonlocal filled
+            if not filled and args[:2] == ["lsjson", "phone:.phonenas/datasets"] and registration.exists():
+                # Another client filled the available slots after approval and
+                # just before this task acquired the registration lock.
+                for index in range(64):
+                    (registry / f"{index:032x}").mkdir(parents=True)
+                filled = True
+            return run(args, *positional, **options)
+
+        with patch.object(self.client, "run", side_effect=register_competing_tasks):
+            with self.assertRaisesRegex(RuntimeError, "登记.*已满"):
+                engine.execute(approved)
+        self.assertTrue(filled)
+        self.assertEqual(len(list(registry.iterdir())), 64)
+        self.assertFalse(registration.exists())
+        self.assertFalse(self.lock(task).exists())
+        self.assertFalse(self.pending(task).exists())
+        self.assertFalse((self.remote / task.remote_path).exists())
+
+    def test_unregistered_task_cannot_restore_another_datasets_archive(self):
+        source, peer_source, destination = self.root / "office", self.root / "other", self.root / "restore"
+        source.mkdir()
+        peer_source.mkdir()
+        destination.mkdir()
+        published = new_task(str(source))
+        unregistered = new_task(str(peer_source), versions_path=published.versions_path)
+        self._write_v1_control(published, _v1_snapshot({}))
+        stamp = "2026-11-18_101000"
+        _put(self.remote / published.versions_path / stamp, {"notes.txt": b"owner's old notes"})
+        _write_json(self.lock(published) / "owner.json", {"version": 1, "dataset_id": published.dataset_id,
+                                                        "writer_identity": published.sync_identity, "token": LOCK_TOKEN})
+
+        history = HistoryService(self.client, unregistered)
+        self.assertEqual(history.list_files(stamp), ["notes.txt"])
+        before = _tree(self.root)
+        offset = len(self.requests)
+        with self.assertRaisesRegex(RuntimeError, "另一个数据集|归属"):
+            history.restore(stamp, destination)
+        self.assertEqual(_tree(self.root), before)
+        self.assertLessEqual(set(self.requests[offset:]), {"OPTIONS", "GET", "HEAD", "PROPFIND"})
+
+    def test_releasing_an_owned_dataset_lock_preserves_unrecognized_entries(self):
+        from app.core.relay import DatasetCoordinator
+
+        task = new_task(str(self.root / "office"))
+        unknown = self.lock(task) / "unrelated.json"
+        with self.assertRaisesRegex(RuntimeError, "锁"):
+            with DatasetCoordinator(self.client, task).lease():
+                unknown.write_bytes(b"unrelated record")
+        self.assertEqual(unknown.read_bytes(), b"unrelated record")
+        self.assertTrue((self.lock(task) / "owner.json").is_file())
 
     def test_phone_history_cannot_restore_or_delete_while_dataset_is_locked(self):
         source, destination = self.root / "office", self.root / "restore"

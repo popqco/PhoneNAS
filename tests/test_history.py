@@ -151,7 +151,8 @@ class HistoryServiceTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.task = make_task(self.root / "source")
         self.client = FakeRclone()
-        lease = patch("app.core.relay.DatasetCoordinator._new_lease", return_value=nullcontext())
+        self.client.config = SimpleNamespace(path=self.root / "config.json", url="", username="")
+        lease = patch("app.core.relay.DatasetCoordinator.control_lease", return_value=nullcontext())
         self.new_lease = lease.start()
         self.addCleanup(lease.stop)
         registration = patch("app.core.relay.DatasetCoordinator.registration_lease", side_effect=lambda *_: nullcontext())
@@ -238,6 +239,7 @@ class HistoryServiceTests(unittest.TestCase):
                 self.assertEqual(self.client.calls, [])
 
     def test_restore_uses_only_listed_files_in_a_fresh_exclusive_child(self):
+        self.client.set_dataset_state(self.task)
         destination = self.root / "chosen"
         destination.mkdir()
         existing = destination / VERSION
@@ -293,7 +295,7 @@ class HistoryServiceTests(unittest.TestCase):
         lock = LocalDatasetLease(self.root / "phone", self.task)
 
         @contextmanager
-        def state_removed_during_acquisition():
+        def state_removed_during_acquisition(*_args, **_kwargs):
             with lock:
                 self.client.states.clear()
                 yield
@@ -334,7 +336,24 @@ class HistoryServiceTests(unittest.TestCase):
         self.assertFalse(any(call[0] == "run" and call[1][0] == "cat" for call in self.client.calls))
         self.assertEqual(self.client.calls[-1], ("purge", f"backup/task-a/versions/{VERSION}"))
 
+    def test_restore_rechecks_archive_ownership_after_claiming_its_lease(self):
+        self.client.set_dataset_state(self.task)
+        destination = self.root / "recovery"
+        destination.mkdir()
+
+        @contextmanager
+        def changed_during_acquisition(*_args, **_kwargs):
+            self.client.set_dataset_state(self.task, phase="publishing")
+            yield
+
+        self.new_lease.side_effect = changed_during_acquisition
+        with self.assertRaisesRegex(RuntimeError, "未完成发布"):
+            HistoryService(self.client, self.task).restore(VERSION, destination)
+        self.assertEqual(list(destination.iterdir()), [])
+        self.assertFalse(any(call[0] == "copyto" for call in self.client.calls))
+
     def test_restore_validates_all_files_before_writes_and_reports_partial_failure(self):
+        self.client.set_dataset_state(self.task)
         destination = self.root / "recovery"
         destination.mkdir()
         self.client.inventory = Result(True, json.dumps([
@@ -353,6 +372,7 @@ class HistoryServiceTests(unittest.TestCase):
         self.assertEqual(len(list(destination.iterdir())), 1)
 
     def test_restore_refuses_source_directory_and_junction_ancestor(self):
+        self.client.set_dataset_state(self.task)
         source = Path(self.task.local_path)
         source.mkdir()
         service = HistoryService(self.client, self.task)
@@ -829,8 +849,12 @@ class LocalHistoryServiceTests(unittest.TestCase):
 class MemoryConfig:
     """The public Config seam without persistence, secrets or APPDATA access."""
 
+    connection_needs_confirmation = False
+
     def __init__(self, tasks):
         self.tasks = tuple(tasks)
+        self.path = Path(self.tasks[0].local_path).parent / "config.json"
+        self.url = self.username = ""
         self.snapshot_count = 0
 
     def get_task(self, task_id):
@@ -888,7 +912,7 @@ class VersionsPageTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         root = Path(self.temp.name)
-        lease = patch("app.core.relay.DatasetCoordinator._new_lease", return_value=nullcontext())
+        lease = patch("app.core.relay.DatasetCoordinator.control_lease", return_value=nullcontext())
         lease.start()
         self.addCleanup(lease.stop)
         registration = patch("app.core.relay.DatasetCoordinator.registration_lease", side_effect=lambda *_: nullcontext())

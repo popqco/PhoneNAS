@@ -6,10 +6,15 @@ from pathlib import Path
 APP_NAME = "PhoneNAS"
 APP_VERSION = "1.2.8"
 
-DEFAULT_URL = "https://100.109.166.11:18889"
+# Old profile fallback pairs. An omitted field alone does not identify the release.
+LEGACY_DEFAULT_URL = "http://100.109.166.11:8888"
+LEGACY_DEFAULT_USERNAME = "admin"
+PREVIEW_DEFAULT_URL = "https://100.109.166.11:18889"  # 58e0eac
+PREVIEW_DEFAULT_USERNAME = "phonenas"
+DEFAULT_LOCAL_PATH = r"D:\LefeetHardware"
+
 DEFAULT_REMOTE = "phone"
 DEFAULT_DRIVE = "X:"
-DEFAULT_LOCAL_PATH = r"D:\LefeetHardware"
 DEFAULT_INTERVAL_MINUTES = 20
 DEFAULT_RETENTION_DAYS = 30
 

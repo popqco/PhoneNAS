@@ -95,27 +95,30 @@ class HistoryService:
         self._lease_factory = lease_factory
 
     @contextmanager
-    def _history_lease(self, *, require_published: bool = False):
-        from app.core.relay import DatasetCoordinator, verify_remote_scope
+    def _history_lease(self, *, deleting: bool = False):
+        from app.core.pending import PendingOperation
+        from app.core.relay import BaselineStore, DatasetCoordinator, verify_remote_scope
 
         if self.protocol is not None:
             # SyncEngine already holds the appropriate leases and checked scope.
             yield
             return
+        config = self.rclone.config
+        journal = PendingOperation(BaselineStore(config.path.parent / "baselines", self.task, config))
         coordinator = DatasetCoordinator(self.rclone, self.task, lease_factory=self._lease_factory)
         if coordinator.locked():
-            raise RuntimeError("数据集有其他操作或未完成发布；不会接管其锁或修改历史文件。")
-        if require_published:
-            verify_remote_scope(self.rclone, self.task, require_ready=True)
-        with coordinator.lease() as lease:
-            if require_published:
+            raise RuntimeError("数据集有其他操作或未完成发布；不会接管其锁或处理历史文件。")
+        verify_remote_scope(self.rclone, self.task, require_ready=True)
+        operation = "history_delete" if deleting else "history_restore"
+        with coordinator.control_lease(journal, operation, registering=deleting) as lease:
+            if deleting:
                 with coordinator.registration_lease(lease):
                     verify_remote_scope(self.rclone, self.task, require_ready=True)
                     yield
             else:
-                state = coordinator.read()
-                if state is not None and state["phase"] != "ready":
-                    raise RuntimeError("数据集有未完成发布；不能恢复手机历史。")
+                # An exact published registration prevents other dataset IDs
+                # from claiming this archive while its own lease is held.
+                verify_remote_scope(self.rclone, self.task, require_ready=True)
                 yield
 
     def _require_batch_names(self, paths: list[str]) -> None:
@@ -169,6 +172,8 @@ class HistoryService:
         return names
 
     def restore(self, version: str, destination: Path, files: Iterable[str] | None = None) -> Path:
+        if self.protocol is not None:
+            raise ValueError("恢复手机历史必须从真实发布记录核对文件名协议和归属。")
         version = _version_name(version)
         self.list_files(version)
         with self._history_lease():
@@ -238,7 +243,7 @@ class HistoryService:
         if version not in self.list_versions():
             raise ValueError("该历史批次已不在当前任务的远端列表中；请刷新后重试")
         self.list_files(version)
-        with self._history_lease(require_published=True):
+        with self._history_lease(deleting=True):
             # Recheck the whole batch, including empty directories, under the
             # shared lock. A timestamp alone is not authority to purge it.
             if self.protocol is None:
